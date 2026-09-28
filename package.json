@@ -1,0 +1,23 @@
+{
+  "name": "chat-window-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "demo": "node samples/make_samples.mjs && node mock/server.js",
+    "test": "node test/verify.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.12",
+    "docx": "^9.7.2",
+    "exceljs": "^4.4.0",
+    "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^6.3.289",
+    "puppeteer-core": "^25.12.0",
+    "word-extractor": "^1.0.4"
+  }
+}

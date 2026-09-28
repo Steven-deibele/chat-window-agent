@@ -1,0 +1,166 @@
+// Mock AI chat page mimicking a provider DOM for end-to-end tests.
+// Serves at http://127.0.0.1:8123/ (any path). Scenario via ?scenario=watch
+// auto-submits a message shortly after load, simulating the user typing in
+// the browser while the tool runs in --watch mode.
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Mock AI Chat</title>
+<style>
+  body{font-family:sans-serif;max-width:720px;margin:24px auto}
+  #log{border:1px solid #ccc;padding:12px;min-height:120px;margin-bottom:12px;white-space:pre-wrap}
+  .user{color:#06c}.assistant{color:#222;margin-top:8px}
+  textarea{width:70%;height:60px}
+</style></head>
+<body>
+<h3>Mock AI Chat</h3>
+<div id="log"></div>
+<textarea id="prompt-textarea" placeholder="Ask..."></textarea>
+<button data-testid="send-button">Send</button>
+<script>
+  const log = document.getElementById('log');
+  const state = { turn: 0 };
+  const qs = new URLSearchParams(location.search);
+
+  function replyFor(prompt) {
+    state.turn++;
+    const agentish = prompt.includes('REPLY FORMAT') || prompt.includes('tool loop');
+    if (qs.get('scenario') === 'agentwatch') {
+      if (agentish) return 'Ready.\n```json\n{"action":"final","summary":"context acknowledged"}\n```';
+      if (prompt.includes('TOOL_RESULT')) return 'All done.\n```json\n{"action":"final","summary":"listed test-files for the user"}\n```';
+      return 'Sure.\n```json\n{"action":"tool","tool":"fs.list","args":{"path":"test-files"}}\n```';
+    }
+    if (qs.get('scenario') === 'agentbatch') {
+      // harness tool results START with TOOL_RESULT; the preamble only mentions it mid-text
+      if (!/^TOOL_RESULTS?\b/.test(prompt.trim())) return 'On it — batching two independent reads.\n```json\n{"action":"tools","calls":[{"tool":"fs.list","args":{"path":"test-files"}},{"tool":"sys.info","args":{}}]}\n```';
+      return 'Done.\n```json\n{"action":"final","summary":"batched fs.list + sys.info in one roundtrip"}\n```';
+    }
+    if (qs.get('scenario') === 'agentcompress') {
+      if (prompt.startsWith('CONTEXT MANAGEMENT')) return 'Summarizing.\n```json\n{"action":"final","summary":"handoff: user asked for a checklist; created checklist.docx; pending review"}\n```';
+      if (prompt.includes('PREVIOUS SESSION SUMMARY')) return 'Resumed.\n```json\n{"action":"final","summary":"context restored' + (prompt.includes('handoff:') ? ' WITH handoff' : ' (NO HANDOFF!)') + '"}\n```';
+      return 'Ready.\n```json\n{"action":"final","summary":"context acknowledged"}\n```';
+    }
+    if (qs.get('scenario') === 'agentsub') {
+      if (prompt.includes('SUB-AGENT ROLE')) state.isSub = true; // remember: this PAGE is a sub-agent
+      if (state.isSub) {
+        if (!/^TOOL_RESULTS?\b/.test(prompt.trim())) return 'Sub working.\n```json\n{"action":"tool","tool":"fs.list","args":{"path":"test-files"}}\n```';
+        return 'Sub done.\n```json\n{"action":"final","summary":"subtask finished: listed test-files"}\n```';
+      }
+      if (!/^TOOL_RESULTS?\b/.test(prompt.trim())) return 'Delegating to two sub-agents.\n```json\n{"action":"tool","tool":"agent.spawn","args":{"tasks":["list files for topic A","list files for topic B"]}}\n```';
+      return 'Parent done.\n```json\n{"action":"final","summary":"spawned 2 sub-agents, both finished"}\n```';
+    }
+    if (prompt.includes('tool loop') && !prompt.includes('TOOL_RESULT')) {
+      return 'Ready.\n```json\n{"action":"final","summary":"context acknowledged"}\n```';
+    }
+    if (qs.get('scenario') === 'agent') {
+      const steps = [
+        'Editing the budget.\n```json\n{"action":"tool","tool":"docs.apply_ops","args":{"file":"test-files/Budget.xlsx","ops":[{"op":"set_cell","sheet":"Sheet1","cell":"B2","value":4242},{"op":"set_format","sheet":"Sheet1","range":"A1","bold":true}]}}\n```',
+        'Creating a reusable tool.\n```json\n{"action":"tool","tool":"tools.create","args":{"name":"notes.add","description":"Append a line to test-files/agent-note.txt","code":"const fs = await import(\'node:fs\'); fs.appendFileSync(\'test-files/agent-note.txt\', String(args.line) + String.fromCharCode(10)); return \'appended: \' + args.line;"}}\n```',
+        'Using the new tool.\n```json\n{"action":"tool","tool":"notes.add","args":{"line":"agent was here"}}\n```',
+        'Hitting an API.\n```json\n{"action":"tool","tool":"http.request","args":{"url":"http://127.0.0.1:8123/"}}\n```',
+        'Downloading.\n```json\n{"action":"tool","tool":"fs.download","args":{"url":"http://127.0.0.1:8123/","path":"test-files/downloaded.html"}}\n```',
+        'All done.\n```json\n{"action":"final","summary":"edited Budget.xlsx, created notes.add tool, used it, made an API call, downloaded a file"}\n```',
+      ];
+      return steps[Math.min(state.turn - 1, steps.length - 1)];
+    }
+    const isPreamble = prompt.includes('REPLY FORMAT');
+    if (!isPreamble && prompt.includes('RETRYTEST')) {
+      if (state.turn <= 1) return 'Sure!\n```json\n{"ops":[{"op":"set_cell","sheet":"Sheet1","cell":"A1","value": BROKEN JSON HERE]\n```';
+      return 'Fixed.\n```json\n{"ops":[{"op":"set_cell","sheet":"Sheet1","cell":"A1","value":"recovered"}],"notes":"second attempt"}\n```';
+    }
+    if (!isPreamble && prompt.includes('BUDGET')) {
+      return 'Updating the budget.\n```json\n{"ops":[' +
+        '{"op":"set_cell","sheet":"Sheet1","cell":"B2","value":9999},' +
+        '{"op":"insert_rows","sheet":"Sheet1","at":4,"count":1},' +
+        '{"op":"set_cell","sheet":"Sheet1","cell":"A5","value":"New item"},' +
+        '{"op":"set_cell","sheet":"Sheet1","cell":"E5","formula":"SUM(B5:D5)"},' +
+        '{"op":"set_format","sheet":"Sheet1","range":"A1:E1","bold":true,"fill":"FFFF00"},' +
+        '{"op":"set_col_width","sheet":"Sheet1","col":"A","width":24}],' +
+        '"notes":"raised Q1 hardware to 9999, added row 5"}\n```';
+    }
+    if (!isPreamble && prompt.includes('HELLODOC')) {
+      return 'Editing the memo.\n```json\n{"ops":[' +
+        '{"op":"replace_text","find":"DRAFT","replace":"FINAL","count":"all"},' +
+        '{"op":"insert_paragraph","text":"Prepared by chat-window-agent.","after":"end"},' +
+        '{"op":"format_paragraph","index":0,"bold":true,"size":16}],' +
+        '"notes":"renamed DRAFT->FINAL"}\n```';
+    }
+    if (!isPreamble && prompt.includes('CHECKLIST')) {
+      return 'Reviewing compliance against the evidence.\n```json\n{"ops":[' +
+        '{"op":"set_table_cell","table":0,"row":1,"col":1,"text":"☒ Compliant (Policy.pdf p1 §1)"},' +
+        '{"op":"set_table_cell","table":0,"row":2,"col":1,"text":"☒ Compliant (Policy.pdf p1 §2)"},' +
+        '{"op":"set_table_cell","table":0,"row":3,"col":1,"text":"✗ Non-compliant (Policy.pdf p1 §3: annual review pending)"},' +
+        '{"op":"replace_text","find":"☐ All evidence attached","replace":"☒ All evidence attached"},' +
+        '{"op":"append_table_row","table":0,"cells":["Review method","AI review of Policy.pdf + Budget.xlsx"]},' +
+        '{"op":"insert_paragraph","text":"Findings: item 3 lacks the annual review record (Policy.pdf §3).","after":"end"}],' +
+        '"notes":"2 compliant, 1 non-compliant, 1 evidence bullet flipped"}\n```';
+    }
+    return 'Understood — context noted. No changes needed yet.\n```json\n{"ops":[],"notes":"preamble acknowledged"}\n```';
+  }
+
+  function send(text) {
+    const u = document.createElement('div');
+    u.className = 'user'; u.setAttribute('data-message-author-role', 'user');
+    u.textContent = text;
+    log.appendChild(u);
+    const a = document.createElement('div');
+    a.className = 'assistant'; a.setAttribute('data-message-author-role', 'assistant');
+    a.textContent = '';
+    log.appendChild(a);
+    const stop = document.createElement('button');
+    stop.setAttribute('data-testid', 'stop-button'); stop.textContent = 'Stop';
+    document.body.appendChild(stop);
+    const full = replyFor(text);
+    let i = 0;
+    const iv = setInterval(() => {
+      i = Math.min(full.length, i + 24);
+      a.textContent = full.slice(0, i);
+      if (i >= full.length) {
+        clearInterval(iv);
+        stop.remove();
+      }
+    }, 30);
+  }
+
+  document.querySelector('[data-testid="send-button"]').onclick = () => {
+    const ta = document.getElementById('prompt-textarea');
+    if (!ta.value.trim()) return;
+    const v = ta.value; ta.value = '';
+    send(v);
+  };
+
+  if (qs.get('scenario') === 'loggedout') {
+    const lb = document.createElement('button');
+    lb.setAttribute('data-testid', 'login-button');
+    lb.textContent = 'Log in';
+    document.body.appendChild(lb);
+    setTimeout(() => lb.remove(), 4000);
+  }
+
+  if (qs.get('scenario') === 'watch') {
+    setTimeout(() => send('CHECKLIST fill now'), 8000);
+  }
+
+  if (qs.get('scenario') === 'agentwatch') {
+    setTimeout(() => send('AGENTWATCH list the test files'), 8000);
+  }
+
+  if (qs.get('scenario') === 'footerdecoy') {
+    // decoy newsletter textarea in a <footer>, BEFORE the real composer in the DOM
+    const f = document.createElement('footer');
+    f.innerHTML = '<textarea placeholder="Subscribe to our newsletter (email)"></textarea>';
+    f.style.cssText = 'position:fixed;bottom:0;left:0;right:0;height:120px;background:#eee;z-index:50';
+    document.body.insertBefore(f, document.body.firstChild);
+  }
+
+  if (qs.get('scenario') === 'captcha') {
+    const w = document.createElement('div');
+    w.innerHTML = '<p>Verify you are human</p><input type=checkbox> I am not a robot';
+    w.style.cssText = 'position:fixed;top:40%;left:40%;background:#fff;border:2px solid #888;padding:20px;z-index:99';
+    document.body.appendChild(w);
+    setTimeout(() => w.remove(), 6000);
+  }
+  if (qs.get('scenario') === 'calibrate') {
+    setTimeout(() => send('reply with the single word PONG'), 5000);
+  }
+</script>
+</body></html>
