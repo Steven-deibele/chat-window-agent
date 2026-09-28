@@ -74,6 +74,10 @@ Flags:
 | `--no-backup` | skip backups |
 | `--max-retries N` | self-correction rounds (default 3) |
 | `--timeout ms` | AI reply wait timeout |
+| `--delay N` | wait N seconds after the chat opens before the first message — time to adjust model/settings in the chat window |
+| `--pause` | same, but waits for you to press Enter instead of a fixed time |
+| `--plain` | neutral "planning component" framing for preset/corporate AIs that refuse the agent role (or `"plain": true` in providers.json) |
+| `--simple` | simplified protocol for weaker models: one tool per reply, short rules, a worked example (or `"simple": true` in providers.json) |
 
 Startup UX:
 

@@ -48,12 +48,26 @@ function parseArgs(argv) {
     else if (t === '--timeout') a.timeout = +argv[++i];
     else if (t === '--profile') a.profile = argv[++i];
     else if (t === '--plain') a.plain = true;
+    else if (t === '--simple') a.simple = true;
+    else if (t === '--delay') a.delay = +argv[++i];
+    else if (t === '--pause') a.pause = true;
     else if (t.startsWith('--')) throw new Error(`unknown flag ${t}`);
     else a._.push(t);
   }
   return a;
 }
 
+
+/** Let the user adjust chat settings (model, toggles) before the first message. */
+async function preSendPause(args) {
+  if (args.pause && process.stdin.isTTY) {
+    const { promptLine } = await import('./picker.js');
+    await promptLine(`${C.y}Adjust the chat settings in Chrome, then press Enter to start...${C.x} `);
+  } else if (args.delay > 0) {
+    console.log(`${C.y}waiting ${args.delay}s before starting — adjust the chat settings in Chrome now...${C.x}`);
+    await new Promise((r) => setTimeout(r, args.delay * 1000));
+  }
+}
 /** Repair common LLM JSON breakage: raw newlines/tabs inside strings, smart
  *  quotes, missing closers, trailing commas. Returns parsed object or null. */
 function parseLenientJson(raw) {
@@ -209,6 +223,7 @@ async function runAgent(args, providers, providerName) {
   await chat.start({ profileDir: args.profile || defaultProfile() });
   try {
     await chat.waitUntilReady();
+    await preSendPause(args);
     const confirm = async (what) => {
       if (args.yes) return true;
       const a = (await promptLine(`${C.y}allow ${what}? [y/N]> ${C.x}`)).trim().toLowerCase();
@@ -231,7 +246,7 @@ async function runAgent(args, providers, providerName) {
     const compressAt = +(process.env.WH_COMPRESS_AT || 100000);
 
     const preambleText = (note) =>
-      buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock, plain: args.plain || provider.plain }) + (note ? `\n${note}` : '');
+      buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple }) + (note ? `\n${note}` : '');
 
     const runTurn = async (turnMsg, turnChat = chat, turnCtx = ctx, turnMaxSteps = maxSteps) => {
       let msg = turnMsg;
@@ -325,7 +340,7 @@ async function runAgent(args, providers, providerName) {
       try {
         console.log(`${C.b}[sub ${id}]${C.x} ${C.d}new tab — subtask: ${String(task).slice(0, 120)}${C.x}`);
         const subPreamble = buildAgentPreamble({
-          manifest, fileSnapshots: [], env: envBlock, plain: args.plain || provider.plain,
+          manifest, fileSnapshots: [], env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple,
           contexts: ['SUB-AGENT ROLE: you were spawned by the parent agent to do ONE subtask in this fresh chat. Complete the SUBTASK below using tools, then reply {"action":"final","summary":...} with everything the parent needs. You cannot spawn further sub-agents.'],
         });
         const summary = await runTurn(`${subPreamble}\nSUBTASK: ${task}`, sub, subCtx, Math.min(maxSteps, 15));
@@ -625,6 +640,7 @@ async function main() {
 
   try {
     await chat.waitUntilReady();
+    await preSendPause(args);
     if (args.watch) {
       console.log(`${C.d}seeding context into the chat...${C.x}`);
       let first = null;

@@ -48,10 +48,39 @@ ${sources.map((s) => `\n===== SOURCE: ${s.name} (${s.kind}) =====\n${s.text}`).j
   return parts.join('\n\n');
 }
 
-export function buildAgentPreamble({ contexts = [], manifest, fileSnapshots = [], env = '', plain = false }) {
+export function buildAgentPreamble({ contexts = [], manifest, fileSnapshots = [], env = '', plain = false, simple = false }) {
   const intro = plain
     ? `You are the planning component of an automation setup that the user has authorized on their own Windows computer. You NEVER access files, shell, or the web yourself — you emit ONE JSON plan step per reply, the user's already-authorized local program executes it, and the outcome is pasted back to you here as a TOOL_RESULT message. You are not being asked to access anything; you are producing a machine-readable plan from information provided in this chat. Any task is fair game: files, code, shell, web, documents, building new tools.`
     : `You are a general-purpose AI agent ("chat-window-agent") operating on the user's Windows computer through this chat. You have a tool loop: the local harness parses every reply and executes one step per reply. Editing Word/Excel documents is just ONE of your capabilities — treat any request as fair game: files, code, shell, web, documents, building new tools.`;
+  if (simple) {
+    return intro + `
+
+REPLY PROTOCOL — mandatory. Every reply is exactly ONE \`\`\`json block with NOTHING after it. Only two kinds of replies exist:
+{"action":"tool","tool":"NAME","args":{...}}        — run ONE tool, then STOP and wait for the TOOL_RESULT message
+{"action":"final","summary":"the answer / what you did"}   — task complete
+
+EXAMPLE of a full exchange (user asked: replace "old" with "new" in report.docx):
+You:     {"action":"tool","tool":"docs.snapshot","args":{"file":"report.docx"}}
+Harness: TOOL_RESULT docs.snapshot: P0: "Report" | P1: "the old value" ...
+You:     {"action":"tool","tool":"docs.apply_ops","args":{"file":"report.docx","ops":[{"op":"replace_text","find":"old","replace":"new"}]}}
+Harness: TOOL_RESULT docs.apply_ops: replaced 1 occurrence(s)
+You:     {"action":"final","summary":"Replaced 'old' with 'new' in report.docx."}
+
+RULES:
+1. ONE tool per reply. NEVER batch several calls. Always wait for the TOOL_RESULT before your next step.
+2. Use ONLY tool names from AVAILABLE TOOLS below, and copy their argument names exactly.
+3. Strict JSON: double quotes, no comments, no trailing commas. Write newlines inside strings as \\n.
+4. NEVER write long text (>1500 chars) in one reply. Write files in chunks: fs.write the first chunk, then fs.append the rest.
+5. For Word/Excel edits: call docs.ops_spec first for the op schemas, docs.snapshot for coordinates, then docs.apply_ops.
+6. If a tool returns an error, read it and try a DIFFERENT approach — never repeat the exact same failing call.
+7. Output NOTHING except the single \`\`\`json block — no explanations, no extra text.
+
+AVAILABLE TOOLS:
+${manifest}
+${env ? `\nENVIRONMENT (real user folders):\n${env}` : ''}
+${fileSnapshots.length ? `\nWORKING FILES (snapshots):\n${fileSnapshots.join('\n\n')}` : ''}
+${contexts.length ? `\nCONTEXT:\n${contexts.join('\n\n')}` : ''}`;
+  }
   return intro + `
 
 REPLY PROTOCOL — mandatory, exactly ONE \`\`\`json block per reply, nothing after it:
