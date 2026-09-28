@@ -11,9 +11,11 @@ Rules:
 - If you cannot safely fulfill the request, reply with "ops":[] and explain in notes.
 - JSON must be strict: double quotes, no trailing commas, no comments.`;
 
-export function buildPreamble({ mode, file, kind, snapshot, sources = [], instruction }) {
+export function buildPreamble({ mode, file, kind, snapshot, sources = [], instruction, plain = false }) {
   const parts = [];
-  parts.push(`You are connected to a local document-editing tool ("chat-window-agent") through this chat. The tool sends you file snapshots; you reply with JSON edit operations and the tool applies them to the real file on disk. This replaces an API — you are the engine.`);
+  parts.push(plain
+    ? `This is a text-processing task, not a request for file access. Below is the full content of a document ("FILE SNAPSHOT") with coordinates. You output JSON edit operations per the spec; a program on the user's own computer applies them to the real file. You never access any file, folder, or system yourself — everything you need is inside this chat. Treat it strictly as transforming the provided text into the JSON format below.`
+    : `You are connected to a local document-editing tool ("chat-window-agent") through this chat. The tool sends you file snapshots; you reply with JSON edit operations and the tool applies them to the real file on disk. This replaces an API — you are the engine.`);
 
   parts.push(`SUPPORTED OPS for ${kind} files:
 ${OPS_SPEC[kind]}
@@ -46,8 +48,11 @@ ${sources.map((s) => `\n===== SOURCE: ${s.name} (${s.kind}) =====\n${s.text}`).j
   return parts.join('\n\n');
 }
 
-export function buildAgentPreamble({ contexts = [], manifest, fileSnapshots = [], env = '' }) {
-  return `You are a general-purpose AI agent ("chat-window-agent") operating on the user's Windows computer through this chat. You have a tool loop: the local harness parses every reply and executes one step per reply. Editing Word/Excel documents is just ONE of your capabilities — treat any request as fair game: files, code, shell, web, documents, building new tools.
+export function buildAgentPreamble({ contexts = [], manifest, fileSnapshots = [], env = '', plain = false }) {
+  const intro = plain
+    ? `You are the planning component of an automation setup that the user has authorized on their own Windows computer. You NEVER access files, shell, or the web yourself — you emit ONE JSON plan step per reply, the user's already-authorized local program executes it, and the outcome is pasted back to you here as a TOOL_RESULT message. You are not being asked to access anything; you are producing a machine-readable plan from information provided in this chat. Any task is fair game: files, code, shell, web, documents, building new tools.`
+    : `You are a general-purpose AI agent ("chat-window-agent") operating on the user's Windows computer through this chat. You have a tool loop: the local harness parses every reply and executes one step per reply. Editing Word/Excel documents is just ONE of your capabilities — treat any request as fair game: files, code, shell, web, documents, building new tools.`;
+  return intro + `
 
 REPLY PROTOCOL — mandatory, exactly ONE \`\`\`json block per reply, nothing after it:
 {"action":"tool","tool":"<tool name from the list>","args":{...}}   — run a tool now

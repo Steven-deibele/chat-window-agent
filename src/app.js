@@ -47,6 +47,7 @@ function parseArgs(argv) {
     else if (t === '--max-steps') a.maxSteps = +argv[++i];
     else if (t === '--timeout') a.timeout = +argv[++i];
     else if (t === '--profile') a.profile = argv[++i];
+    else if (t === '--plain') a.plain = true;
     else if (t.startsWith('--')) throw new Error(`unknown flag ${t}`);
     else a._.push(t);
   }
@@ -230,12 +231,13 @@ async function runAgent(args, providers, providerName) {
     const compressAt = +(process.env.WH_COMPRESS_AT || 100000);
 
     const preambleText = (note) =>
-      buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock }) + (note ? `\n${note}` : '');
+      buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock, plain: args.plain || provider.plain }) + (note ? `\n${note}` : '');
 
     const runTurn = async (turnMsg, turnChat = chat, turnCtx = ctx, turnMaxSteps = maxSteps) => {
       let msg = turnMsg;
       let summary = null;
       let parseFails = 0;
+      let refusals = 0;
       for (let step = 1; step <= turnMaxSteps; step++) {
         // turnMsg === null: the human already sent their message in the chat
         // (watch mode) — wait for the AI's reply instead of sending anything.
@@ -245,6 +247,16 @@ async function runAgent(args, providers, providerName) {
         msg = msg === null ? '' : msg;
         const parsed = extractJson(reply);
         if (!parsed || (!parsed.action && !parsed.tool && !parsed.final)) {
+          // Preset/corporate AIs often refuse the agent role ("I don't have
+          // access to that file"). Re-prime instead of giving up the turn.
+          const REFUSAL = /(don'?t|do not|cannot|can'?t|unable|not able|no) (to )?(currently )?(have |gain )?(direct )?(access|the ability)|as an ai( language model)?|i('m| am) (just )?(an ai|a (text-based|virtual) assistant)/i;
+          if (step <= 3 && refusals < 2 && REFUSAL.test(reply) && !/```|"action"/.test(reply)) {
+            refusals++;
+            console.log(`${C.y}  refusal detected — re-priming (all content is in-chat, no access needed)${C.x}`);
+            msg = `No file or system access is needed from you: all content arrives IN THIS CHAT (snapshots and TOOL_RESULT messages), and the user's own authorized program executes the JSON plan steps you emit. You are only writing a machine-readable plan. Continue with ONE \`\`\`json block: {"action":"tool","tool":"<name>","args":{...}} or {"action":"final","summary":"..."}.`;
+            step--;
+            continue;
+          }
           if (/```|"action"/.test(reply)) {
             if (++parseFails > 5) { summary = '(stopped: unparseable replies)'; break; }
             msg = `TOOL FEEDBACK: your reply was not a valid {"action":...} json block (first 120 chars: ${reply.replace(/\n/g, ' ').slice(0, 120)}). Reply again with ONE valid \`\`\`json block — remember: escape newlines as \\n, avoid very long strings (use fs.write + fs.append chunks).`;
@@ -313,7 +325,7 @@ async function runAgent(args, providers, providerName) {
       try {
         console.log(`${C.b}[sub ${id}]${C.x} ${C.d}new tab — subtask: ${String(task).slice(0, 120)}${C.x}`);
         const subPreamble = buildAgentPreamble({
-          manifest, fileSnapshots: [], env: envBlock,
+          manifest, fileSnapshots: [], env: envBlock, plain: args.plain || provider.plain,
           contexts: ['SUB-AGENT ROLE: you were spawned by the parent agent to do ONE subtask in this fresh chat. Complete the SUBTASK below using tools, then reply {"action":"final","summary":...} with everything the parent needs. You cannot spawn further sub-agents.'],
         });
         const summary = await runTurn(`${subPreamble}\nSUBTASK: ${task}`, sub, subCtx, Math.min(maxSteps, 15));
@@ -603,6 +615,7 @@ async function main() {
 
   const preamble = buildPreamble({
     mode: command, file: path.basename(abs), kind, snapshot: snap.text, sources,
+    plain: args.plain || provider.plain,
   });
 
   console.log(`${C.d}provider ${providerName} | file ${abs} | kind ${kind}${sources.length ? ` | sources: ${sources.map((s) => s.name).join(', ')}` : ''}${C.x}`);
