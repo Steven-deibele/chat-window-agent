@@ -156,6 +156,16 @@ redirects). If the tab is closed, it re-attaches to another tab on the same site
 instead of opening a new window — your conversation context is never silently
 duplicated. Rename saved providers with `run.bat rename <old> <new>`.
 
+When you create a provider via **Custom…**, the setup also asks three behavior
+questions — neutral framing for preset AIs (`plain`), simplified protocol for
+weaker models (`simple`), and a startup delay so you can adjust chat settings
+before the first message. Change them any time with:
+
+```
+run.bat config            # pick a saved provider, answer y/n + delay (Enter keeps current)
+run.bat config <name>     # skip the picker
+```
+
 ### Preset AIs that refuse ("I don't have access to that file…")
 
 Company chat AIs often ship with a fixed persona that insists it cannot touch

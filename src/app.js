@@ -59,13 +59,14 @@ function parseArgs(argv) {
 
 
 /** Let the user adjust chat settings (model, toggles) before the first message. */
-async function preSendPause(args) {
+async function preSendPause(args, provider) {
+  const delay = args.delay ?? provider?.delay;
   if (args.pause && process.stdin.isTTY) {
     const { promptLine } = await import('./picker.js');
     await promptLine(`${C.y}Adjust the chat settings in Chrome, then press Enter to start...${C.x} `);
-  } else if (args.delay > 0) {
-    console.log(`${C.y}waiting ${args.delay}s before starting — adjust the chat settings in Chrome now...${C.x}`);
-    await new Promise((r) => setTimeout(r, args.delay * 1000));
+  } else if (delay > 0) {
+    console.log(`${C.y}waiting ${delay}s before starting — adjust the chat settings in Chrome now...${C.x}`);
+    await new Promise((r) => setTimeout(r, delay * 1000));
   }
 }
 /** Repair common LLM JSON breakage: raw newlines/tabs inside strings, smart
@@ -223,7 +224,7 @@ async function runAgent(args, providers, providerName) {
   await chat.start({ profileDir: args.profile || defaultProfile() });
   try {
     await chat.waitUntilReady();
-    await preSendPause(args);
+    await preSendPause(args, provider);
     const confirm = async (what) => {
       if (args.yes) return true;
       const a = (await promptLine(`${C.y}allow ${what}? [y/N]> ${C.x}`)).trim().toLowerCase();
@@ -546,6 +547,40 @@ async function renameProvider(args) {
   console.log(`use it with: --provider ${newName}`);
 }
 
+/** Adjust behavior settings (plain/simple/delay) of a saved provider.
+ *  "config [name]" — bare "config" lists saved providers to pick from. */
+async function configProvider(args) {
+  const file = path.resolve('providers.json');
+  const cfg = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+  const saved = Object.keys(cfg);
+  if (!saved.length) {
+    console.log('no custom providers saved yet — create one with the Custom… entry in the provider menu');
+    return;
+  }
+  const { promptLine } = await import('./picker.js');
+  let [name] = args._;
+  if (!name) {
+    console.log('\nSaved providers:');
+    saved.forEach((n, i) => console.log(`  ${i + 1}) ${n}  ${C.d}${cfg[n].label || ''}${C.x}`));
+    const pick = (await promptLine(`configure which (1-${saved.length})> `)).trim();
+    name = saved[+pick - 1];
+    if (!name) { console.log('nothing selected'); return; }
+  }
+  const p = cfg[name];
+  if (!p) throw new Error(`no saved provider "${name}" in providers.json (saved: ${saved.join(', ') || 'none'})`);
+  const ask = async (label, cur) => {
+    const a = (await promptLine(`${label} [${cur}]> `)).trim();
+    return a === '' ? cur : a;
+  };
+  p.plain = /^y/i.test(await ask('plain framing — preset AI refuses agent roles (y/n)', p.plain ? 'y' : 'n'));
+  p.simple = /^y/i.test(await ask('simple protocol — one tool per reply, for weaker models (y/n)', p.simple ? 'y' : 'n'));
+  const delay = +(await ask('startup delay seconds (time to adjust chat settings)', String(p.delay || 0)));
+  if (delay > 0) p.delay = delay; else delete p.delay;
+  fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+  console.log(`${C.g}saved "${name}": plain=${!!p.plain} simple=${!!p.simple} delay=${p.delay || 0}s${C.x}`);
+  console.log(`${C.d}takes effect on the next run — no restart of this command needed${C.x}`);
+}
+
 async function main() {
 
 
@@ -557,6 +592,7 @@ async function main() {
   }
   const cmd = !command || command === 'chat' ? 'agent' : command; // default: conversational agent
   if (cmd === 'rename') return renameProvider(args);
+  if (cmd === 'config') return configProvider(args);
   let providers = loadProviders();
   let providerName = args.provider;
   if (!providerName && (process.stdin.isTTY || process.env.WH_PROVIDER_MENU)) {
@@ -640,7 +676,7 @@ async function main() {
 
   try {
     await chat.waitUntilReady();
-    await preSendPause(args);
+    await preSendPause(args, provider);
     if (args.watch) {
       console.log(`${C.d}seeding context into the chat...${C.x}`);
       let first = null;
@@ -713,6 +749,10 @@ async function createCustomProvider(promptLine) {
   const defName = parsed.hostname.replace(/^www\./, '').split('.')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-') || 'custom';
   let name = (await promptLine(`short name [${defName}]> `)).trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
   if (!name) name = defName;
+  const yesNo = async (q) => /^y/i.test((await promptLine(q)).trim());
+  const plain = await yesNo('preset/corporate AI that refuses agent roles? enable neutral framing [y/N]> ');
+  const simple = await yesNo('weaker model? enable simplified one-tool-per-reply protocol [y/N]> ');
+  const delay = +((await promptLine('startup delay in seconds (time to adjust chat settings) [0]> ')).trim()) || 0;
   const providers = loadProviders();
   while (providers[name]) name = name.replace(/-\d+$/, '') + '-' + Math.floor(Math.random() * 90 + 10);
   providers[name] = {
@@ -725,6 +765,9 @@ async function createCustomProvider(promptLine) {
     assistant: ["[data-message-author-role='assistant']", "[class*='assistant' i]", '.markdown', "[class*='response' i]"],
     busy: ["button[data-testid='stop-button']", "button[aria-label*='Stop' i]"],
     replyTimeoutMs: 300000,
+    ...(plain ? { plain: true } : {}),
+    ...(simple ? { simple: true } : {}),
+    ...(delay > 0 ? { delay } : {}),
   };
   const file = path.resolve('providers.json');
   const existing = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
