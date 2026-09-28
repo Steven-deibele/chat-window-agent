@@ -246,6 +246,7 @@ async function runAgent(args, providers, providerName) {
     };
     const compressAt = +(process.env.WH_COMPRESS_AT || 100000);
 
+    let lastTurnProtocol = false; // did the last turn follow the json protocol at all?
     const preambleText = (note) =>
       buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple }) + (note ? `\n${note}` : '');
 
@@ -254,6 +255,7 @@ async function runAgent(args, providers, providerName) {
       let summary = null;
       let parseFails = 0;
       let refusals = 0;
+      let viaProtocol = false; // at least one valid protocol reply this turn
       for (let step = 1; step <= turnMaxSteps; step++) {
         // turnMsg === null: the human already sent their message in the chat
         // (watch mode) — wait for the AI's reply instead of sending anything.
@@ -284,6 +286,7 @@ async function runAgent(args, providers, providerName) {
           break;
         }
         if (parsed.action === 'final' || parsed.final) {
+          viaProtocol = true;
           summary = parsed.summary || parsed.final;
           break;
         }
@@ -315,13 +318,18 @@ async function runAgent(args, providers, providerName) {
           results.push(`${toolName || '?'}: ${resStr}`);
         }
         const combined = results.join('\n');
-        msg = `TOOL_RESULT${results.length > 1 ? `S (${results.length} calls)` : ''} ${combined.slice(0, 6000)}\nContinue: next {"action":"tool",...} step, or {"action":"final",...}.${step === turnMaxSteps - 1 ? ' (One step left — reply with final next.)' : ''}`;
+        viaProtocol = true;
+        const sticky = (args.plain || args.simple || provider.plain || provider.simple)
+          ? '\nPROTOCOL REMINDER: reply with ONE ```json block ONLY — {"action":"tool","tool":"NAME","args":{...}} or {"action":"final","summary":"..."}. No prose, no explanations, nothing after the block.'
+          : '';
+        msg = `TOOL_RESULT${results.length > 1 ? `S (${results.length} calls)` : ''} ${combined.slice(0, 6000)}\nContinue: next {"action":"tool",...} step, or {"action":"final",...}.${step === turnMaxSteps - 1 ? ' (One step left — reply with final next.)' : ''}${sticky}`;
       }
       if (summary === null) {
         const reply = await sendReliable(turnChat, 'TOOL_BUDGET exhausted — reply with {"action":"final","summary":...} now.');
         const parsed = extractJson(reply);
         summary = parsed?.summary || parsed?.final || reply.trim().slice(0, 500);
       }
+      lastTurnProtocol = viaProtocol;
       return summary;
     };
 
@@ -377,7 +385,15 @@ async function runAgent(args, providers, providerName) {
       console.log(`${C.g}new chat ready.${C.x} ${C.d}AI:${C.x} ${String(ack).slice(0, 160)}`);
     };
 
-    const goalSummary = await runTurn(preambleText(args.ask ? `GOAL: ${args.ask}` : "Awaiting the user's first request; the next message will contain it."));
+    const goalSummary = await runTurn(preambleText((args.ask ? `GOAL: ${args.ask}` : "Awaiting the user's first request; the next message will contain it.") + '\nFirst, acknowledge the protocol with {"action":"final","summary":"ready"}.'));
+    if (!lastTurnProtocol) {
+      console.log(`${C.y}${C.B}WARNING: this chat did not follow the json protocol on the first exchange.${C.x}`);
+      console.log(`${C.y}Its system prompt is likely overriding the harness. Things that help:${C.x}`);
+      console.log(`${C.y}  1. pick a different model / turn off custom personas in the chat settings (use --delay or --pause)${C.x}`);
+      console.log(`${C.y}  2. put the protocol in the chat's custom-instructions/system field if it has one${C.x}`);
+      console.log(`${C.y}  3. enable neutral framing + simple protocol: run.bat config <provider>  (plain=y simple=y)${C.x}`);
+      console.log(`${C.y}Continuing anyway — watch the first tool steps closely.${C.x}`);
+    }
     if (args.ask) {
       console.log(`\n${C.g}${C.B}DONE:${C.x} ${goalSummary}`);
       return;

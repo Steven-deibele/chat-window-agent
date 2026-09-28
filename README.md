@@ -183,6 +183,22 @@ countermeasures:
 If your company chat has a custom-instructions/system-prompt field, pasting
 the neutral framing there makes it stick for the whole conversation.
 
+### Fixed system prompts that override the harness
+
+A built-in system prompt always outranks user messages, so the harness fights
+drift instead of fighting priority:
+
+- **Protocol handshake**: the first exchange asks for a one-word json ack. If
+  the chat can't follow the protocol even once, you get a loud warning with
+  concrete fixes *before* your real task is wasted.
+- **Sticky protocol footer**: with `plain` or `simple` enabled, every
+  TOOL_RESULT ends with a compact protocol reminder — the instruction is
+  always the most recent thing the model reads, which beats persona drift.
+- **UI-level fixes** (best when available): use `--pause`/`--delay` to switch
+  to a less-restricted model, disable a custom persona, or paste the protocol
+  into the chat's own instructions/project field — a system-level slot beats
+  any repetition the harness can do.
+
 ## No-admin install (work computers)
 
 Everything is user-level: dependencies install into this folder (`npm install`),
