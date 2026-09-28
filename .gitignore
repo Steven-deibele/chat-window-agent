@@ -4,3 +4,4 @@ node_modules/
 test-files/
 backups/
 node-portable/
+providers.json
