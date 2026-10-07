@@ -51,7 +51,7 @@ The reply is printed on stdout, so calling programs can capture it directly.
 run.bat gui            # opens a settings window in your browser (no typing commands)
 ```
 
-or **double-click `chat-window-agent.vbs`** — same window, no console at all.
+or **run `powershell -File make-shortcut.ps1` once** and use the Desktop shortcut it creates — same window, console minimized. (The old `chat-window-agent.vbs` launcher was removed: VBScript spawning a hidden shell gets blocked by endpoint protection like CrowdStrike Falcon.)
 
 The window lets you pick the mode (agent / edit / fill / ask / calibrate /
 doctor / models), the AI chat provider, files (Browse… buttons use the native
