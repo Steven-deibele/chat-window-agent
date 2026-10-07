@@ -14,12 +14,15 @@
   "type": "module",
   "dependencies": {
     "@xmldom/xmldom": "^0.9.12",
-    "docx": "^9.7.2",
+    "docx": "^9.9.0",
     "exceljs": "^4.4.0",
     "node-llama-cpp": "^3.22.1",
     "pdf-parse": "^2.4.5",
-    "pdfjs-dist": "^6.3.289",
+    "pdfjs-dist": "^6.4.299",
     "puppeteer-core": "^25.12.0",
     "word-extractor": "^1.0.4"
+  },
+  "allowScripts": {
+    "node-llama-cpp@3.22.1": true
   }
 }

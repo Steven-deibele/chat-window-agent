@@ -191,9 +191,19 @@ export class LocalChat {
   /** Send a message, return the reply text. Same contract as AIChat.send. */
   async send(text) {
     const t0 = Date.now();
+    let tokens = 0;
+    let firstTokenAt = 0;
     try {
-      const reply = await this.bounded(this.session.prompt(text), this.timeoutMs, 'local model reply');
-      this.log(`local model replied in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      const reply = await this.bounded(this.session.prompt(text, {
+        onToken: (t) => { if (!firstTokenAt) firstTokenAt = Date.now(); tokens += t.length; },
+      }), this.timeoutMs, 'local model reply');
+      const secs = (Date.now() - t0) / 1000;
+      if (tokens > 0 && firstTokenAt) {
+        const genSecs = Math.max((Date.now() - firstTokenAt) / 1000, 0.001);
+        this.log(`local model replied in ${secs.toFixed(1)}s — ${tokens} tokens, ${(tokens / genSecs).toFixed(1)} tok/s`);
+      } else {
+        this.log(`local model replied in ${secs.toFixed(1)}s`);
+      }
       return String(reply ?? '').trim();
     } catch (e) {
       if (/context|kv|sequence|token/i.test(e.message)) {
