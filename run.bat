@@ -6,9 +6,12 @@ rem (user-level, no installer, no admin - just PowerShell, present on all Window
 setlocal
 cd /d "%~dp0"
 
-set "NODEVER=v22.14.0"
+set "NODEVER=v24.21.0"
 set "NODE="
-if exist "node-portable\node.exe" set "NODE=node-portable\node.exe"
+if exist "node-portable\node.exe" (
+  set "NODE=node-portable\node.exe"
+  set "PATH=%CD%\node-portable;%PATH%"
+)
 if not defined NODE (
   where node >nul 2>nul && set "NODE=node"
 )
@@ -16,6 +19,7 @@ if not defined NODE (
   echo [chat-window-agent] Node.js not found - downloading portable Node %NODEVER% ^(no admin needed^)...
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; $zip=\"$env:TEMP\node-%NODEVER%-win-x64.zip\"; Invoke-WebRequest -Uri 'https://nodejs.org/dist/%NODEVER%/node-%NODEVER%-win-x64.zip' -OutFile $zip; Expand-Archive -Path $zip -DestinationPath \"$env:TEMP\node-portable-x\" -Force; if (Test-Path 'node-portable') { Remove-Item -Recurse -Force 'node-portable' }; Move-Item \"$env:TEMP\node-portable-x\node-%NODEVER%-win-x64\" 'node-portable'; Remove-Item $zip" || (echo [chat-window-agent] portable Node download failed - check network/proxy & exit /b 1)
   set "NODE=node-portable\node.exe"
+  set "PATH=%CD%\node-portable;%PATH%"
 )
 
 if "%NODE%"=="node" (
