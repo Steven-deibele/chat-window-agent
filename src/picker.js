@@ -47,11 +47,18 @@ async function dialogPick(exts, { title, multi }) {
     const psFilter = exts.map((e) => `${EXT_LABELS[e] || e} (*.${e})|*.${e}`).join('|') + '|All files (*.*)|*.*';
     const ps = [
       "Add-Type -AssemblyName System.Windows.Forms | Out-Null",
+      "Add-Type -AssemblyName System.Drawing | Out-Null",
+      // invisible topmost owner form: keeps the dialog in the foreground even
+      // when the caller is a hidden/background process (GUI launcher, VBS)
+      "$f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; $f.ShowInTaskbar = $false; $f.FormBorderStyle = 'None'; $f.Opacity = 0; $f.StartPosition = 'CenterScreen'",
+      "$f.Show(); $f.Activate()",
       "$d = New-Object System.Windows.Forms.OpenFileDialog",
       `$d.Title = ${psStr(title)}`,
       `$d.Filter = ${psStr(psFilter)}`,
       `$d.Multiselect = ${multi ? '$true' : '$false'}`,
-      "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames -join \"`n\" } else { '' }",
+      "$r = $d.ShowDialog($f)",
+      "$f.Close()",
+      "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames -join \"`n\" } else { '' }",
     ].join('; ');
     const { code, out } = await run('powershell.exe', ['-NoProfile', '-STA', '-Command', ps]);
     if (code !== 0) return undefined; // dialog unavailable -> list fallback

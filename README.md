@@ -23,12 +23,55 @@ In `fill` mode you're also asked to select the evidence documents (multi-select;
 type `all` in the list to review everything found). `--against <folder>` adds every
 supported document in a directory.
 
+**Asking a big AI one question** (no tools, no protocol — the cloud model is a
+colleague, not an agent; built for harnesses that offload hard reasoning):
+
+```
+echo "self-contained question" | node src/app.js ask --provider chatgpt
+node src/app.js ask --provider claude --ask "shorter question"
+```
+
+Everything sent passes through a local scrubber (`src/scrub.js`): API keys,
+tokens, JWTs, private keys, emails, IPs and user paths are replaced with
+placeholders before anything leaves the machine (a `scrubbed: …` report goes to
+stderr; placeholders are explained to the AI in the priming message). Add your
+own company names/terms to `scrub-rules.json` (cwd or app root):
+`[{"pattern": "AcmeCorp", "replacement": "<COMPANY>"}, {"regex": "PROJ-\\d+"}]`.
+The reply is printed on stdout, so calling programs can capture it directly.
+
 - Chrome is launched once with a dedicated debugging profile (`.chrome-profile/`); **log into your AI chat in that window once** and the session persists.
 - The first message of the chat is seeded with a snapshot of your file (paragraph indices, table grids, sheet/cell coordinates) plus the exact ops contract. The AI must reference only those coordinates.
 - Every AI reply is parsed for one ```json block; invalid or failing ops trigger an automatic `TOOL FEEDBACK` message so the AI corrects itself (up to `--max-retries`).
 - Sources (`--against`) are attached read-only: .docx, .xlsx, .pdf (text-based; no OCR), .csv, .txt, .md.
 
 # Usage
+## No-terminal mode (settings window)
+
+```
+run.bat gui            # opens a settings window in your browser (no typing commands)
+```
+
+or **double-click `chat-window-agent.vbs`** — same window, no console at all.
+
+The window lets you pick the mode (agent / edit / fill / ask / calibrate /
+doctor / models), the AI chat provider, files (Browse… buttons use the native
+file dialog), evidence as **files or a whole folder** (Add folder… opens an
+in-window folder browser and reviews every document inside), an optional
+instruction, and every flag (`--watch`, `--yes`,
+`--no-backup`, `--plain`, `--simple`, retries/timeout/delay, local-model
+options). It shows the exact `run.bat` command it will run, streams the
+session output into the window, and has an input box that talks to the
+session — the `agent>` REPL and `[y/N]` approval prompts work there, so the
+terminal is never needed. Settings persist between runs
+(`gui-settings.json`). Closing the window shuts the server down.
+
+**＋ Custom…** next to the provider dropdown adds a company/work chat window
+(URL + name + behavior options) — saved to `providers.json`, same as the
+terminal chooser. In agent mode, a **"local AI runs alongside"** checkbox
+(`--with-local`) loads your downloaded GGUF model next to the chat-window AI
+so the two can work together (the chat AI gets a `local.ask` tool); on by
+default when a model is downloaded.
+
 
 ```
 run.bat                # agent chat (default) — general-purpose AI agent REPL
@@ -62,6 +105,23 @@ no handoff, `exit` quits. Sessions also auto-compress once they grow past
 `WH_COMPRESS_AT` chars (default 100000). `--ask "..."` runs one goal
 non-interactively; `--yes` skips the [y/N] gate on `shell.run`/`fs.write`.
 
+## Persistent memory (across sessions)
+
+Inspired by [pi-optchat](https://github.com/jonaslsaa/pi-optchat): the agent
+keeps long-term memory on disk so context survives restarts, new chats, and
+`/compress`:
+
+- `memory/memory.md` — a bounded "memory view" (durable facts, decisions,
+  preferences, project state) injected into every session's preamble. The AI
+  maintains it itself with the `memory.update` tool; `/memory` in the REPL
+  shows it, and you can edit the file directly.
+- `memory/journal.jsonl` — append-only log of every request, final summary,
+  and compress handoff. When the view isn't detailed enough, the AI looks up
+  older turns here with `fs.search`/`fs.read`.
+
+`WH_MEMORY=off` disables it; `WH_MEMORY_DIR` relocates it. Compress summaries
+are journaled before the new chat starts, so nothing is lost either way.
+
 Flags:
 
 | flag | meaning |
@@ -78,6 +138,7 @@ Flags:
 | `--pause` | same, but waits for you to press Enter instead of a fixed time |
 | `--plain` | neutral "planning component" framing for preset/corporate AIs that refuse the agent role (or `"plain": true` in providers.json) |
 | `--simple` | simplified protocol for weaker models: one tool per reply, short rules, a worked example (or `"simple": true` in providers.json) |
+| `--with-local` | load the on-machine GGUF model *alongside* a browser chat session; the chat-window AI gains a `local.ask` tool to hand it on-machine work (summarize/extract/rewrite pasted text — nothing leaves the computer). `--model` picks which model |
 
 Startup UX:
 
@@ -119,6 +180,20 @@ from env vars via `"env:VARNAME"`, e.g. Azure DevOps/Agile, Jira), and
 `ui.pick_files` (native file-explorer dialog so the agent can ask *you* which file),
 `agent.spawn` (parallel sub-agents in new tabs).
 
+**Computer use** — the agent can operate apps directly:
+
+- `browser.*` — drives its **own tab** in the same logged-in Chrome (the AI chat
+  tab is never touched): `browser.open` / `browser.read` (numbered interactive
+  elements + page text) / `browser.click` / `browser.type` / `browser.scroll` /
+  `browser.eval` / `browser.tabs` / `browser.screenshot` / `browser.close`.
+  Web apps, portals, dashboards — anything needing JS or your login session.
+- `desktop.*` (Windows) — drives **native app windows** via UI Automation:
+  `desktop.windows` (list windows), `desktop.tree` (button/field names in an
+  app), `desktop.click` (click an element by name), `desktop.type` (paste text
+  into the focused field), `desktop.keys` (SendKeys shortcuts: `{ENTER}`, `^a`).
+  Desktop clicks/keystrokes act on the real app — they run without an approval
+  prompt (same trust level as `shell.run`); use `--yes`-free sessions with care.
+
 **Sub-agents** — for large tasks the agent can call `agent.spawn` with
 `{"tasks":[...]}`: each subtask runs in a **new browser tab with its own fresh
 chat**, in parallel (max 4), with the same tool set. Each sub-agent reports a
@@ -134,6 +209,50 @@ restart — prefer `tools/`.
 
 Dangerous actions (`shell.run`, `fs.write`, `fs.download`, non-GET `http.request`)
 ask for terminal approval unless `--yes`.
+
+## Local models (GGUF, offline, no browser)
+
+The `local` provider runs a GGUF model **on this machine** via
+[node-llama-cpp](https://github.com/withcatai/node-llama-cpp) (llama.cpp) — no
+browser, no login, works offline. GPU is used automatically when available.
+
+```
+run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # download once (into models/)
+run.bat models use  hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # make it the default
+run.bat agent --provider local                          # REPL driven by the local model
+run.bat agent --provider local --model hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m --ask "list the files here"
+```
+
+Model references: `hf:owner/repo:QUANT` (auto-downloads on first use),
+`hf:owner/repo/file.gguf`, or a path to an existing `.gguf`. `run.bat models`
+lists what's downloaded; `models rm <name>` deletes. Gated Hugging Face repos
+need `HF_TOKEN` set. The local provider defaults to the **simple protocol**
+(one tool call per reply), which small models follow much more reliably.
+
+Not sure what size your machine can handle? `run.bat models recommend` probes
+CPU/RAM/GPU (incl. VRAM), computes a safe model budget that leaves the system
+responsive, suggests the matching size class with its pull command, and flags
+downloaded models that are too big or tight for this machine.
+
+**Asking the big AI for help** — the local agent can call the `remote.ask`
+tool: it opens (once) a browser chat with ChatGPT/Claude/Gemini
+(`--remote-provider claude` to choose) and pastes a self-contained question,
+returning the reply as a tool result. Local model does the file/tool work,
+cloud model handles the hard reasoning. The browser session is only opened on
+first use; `--watch`/`calibrate`/`doctor` don't apply to the local provider.
+
+**Offloading hard thinking** — `--offload <level>` (or `"offload"` on the
+local provider in providers.json) controls how eagerly the local model sends
+hard thinking to the big AI: `off` (never), `low` (only when genuinely stuck),
+`normal` (default — analysis, planning, long writing, judgement calls go to
+`remote.ask`; mechanical steps stay local), `aggressive` (the local model is
+only the hands; it asks first for anything non-trivial and follows the answer
+step by step). If it offloads too little or too much for your taste, just
+change the level — the policy is spelled out in the preamble it reads.
+
+Limits: local models have small context windows — sessions auto-compress at
+~16k chars (`WH_COMPRESS_AT` to change); keep tasks focused. Sub-agents
+(`agent.spawn`) share the loaded model in separate sessions.
 
 ## Company / custom AI chat windows
 

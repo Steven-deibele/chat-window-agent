@@ -59,6 +59,14 @@ export const DEFAULT_PROVIDERS = {
     loggedOut: [],
     replyTimeoutMs: 300000,
   },
+  local: {
+    label: 'Local model (GGUF on this machine, offline)',
+    local: true, // no browser; runs via node-llama-cpp — see src/local_chat.js
+    model: null, // set with --model <ref>, providers.json, or `run.bat models use <ref>`
+    simple: true, // local models are weaker: one tool call per reply
+    offload: 'normal', // how eagerly hard thinking goes to remote.ask: off|low|normal|aggressive
+    replyTimeoutMs: 600000,
+  },
   mock: {
     label: 'Mock (local test chat)',
     newChat: 'http://127.0.0.1:8123/',
@@ -87,6 +95,38 @@ export function loadProviders() {
     }
   }
   return providers;
+}
+
+/** Create and persist a custom provider for any chat URL (company/self-hosted
+ *  chat UIs). Writes providers.json in the cwd so it appears in the chooser,
+ *  --provider, and the GUI from now on. Returns { name, entry }. */
+export function saveCustomProvider({ url, name, plain = false, simple = false, delay = 0 } = {}) {
+  if (!url) throw new Error('custom provider needs a URL');
+  if (!/^[a-z]+:\/\//i.test(url)) url = 'https://' + url;
+  const parsed = new URL(url);
+  const defName = parsed.hostname.replace(/^www\./, '').split('.')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-') || 'custom';
+  name = (name || defName).trim().toLowerCase().replace(/[^a-z0-9-]/g, '-') || defName;
+  const providers = loadProviders();
+  while (providers[name]) name = name.replace(/-\d+$/, '') + '-' + Math.floor(Math.random() * 90 + 10);
+  const entry = {
+    label: `${name} (${parsed.hostname})`,
+    newChat: url,
+    match: parsed.host,
+    // generic best-effort selectors — tweak in providers.json if needed
+    input: ["div[contenteditable='true']", 'textarea'],
+    send: ["button[data-testid='send-button']", "button[aria-label='Send message']", "button[aria-label*='Send' i]", "button[type='submit']"],
+    assistant: ["[data-message-author-role='assistant']", "[class*='assistant' i]", '.markdown', "[class*='response' i]"],
+    busy: ["button[data-testid='stop-button']", "button[aria-label*='Stop' i]"],
+    replyTimeoutMs: 300000,
+    ...(plain ? { plain: true } : {}),
+    ...(simple ? { simple: true } : {}),
+    ...(delay > 0 ? { delay } : {}),
+  };
+  const file = path.resolve('providers.json');
+  const existing = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+  existing[name] = entry;
+  fs.writeFileSync(file, JSON.stringify(existing, null, 2) + '\n');
+  return { name, entry, file };
 }
 
 function os_home() {

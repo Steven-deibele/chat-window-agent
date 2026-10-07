@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "demo": "node samples/make_samples.mjs && node mock/server.js",
-    "test": "node test/verify.mjs"
+    "test": "node test/verify.mjs",
+    "test:gui": "node test/gui_smoke.mjs"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +16,7 @@
     "@xmldom/xmldom": "^0.9.12",
     "docx": "^9.7.2",
     "exceljs": "^4.4.0",
+    "node-llama-cpp": "^3.22.1",
     "pdf-parse": "^2.4.5",
     "pdfjs-dist": "^6.3.289",
     "puppeteer-core": "^25.12.0",
