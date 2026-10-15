@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const OPS_SPEC = {
-  docx: `"op":"replace_text"   {find, replace, count?:"all"|"first", regex?:bool}
+  docx: `"op":"replace_text"   {find, replace, count?:"all"|"first" ("first" = first occurrence in the document), regex?:bool}
 "op":"insert_paragraph" {text, style?:string, after: <P-index from snapshot> | "end"}
 "op":"delete_paragraph" {index: <P-index>} | {match: "exact paragraph text"}
 "op":"set_paragraph_style" {index | match, style}
@@ -16,13 +16,13 @@ export const OPS_SPEC = {
 "op":"delete_rows"     {sheet, at, count?}
 "op":"insert_cols"     {sheet, at, count?}
 "op":"delete_cols"     {sheet, at, count?}
-"op":"set_format"      {sheet, range:"A1:C1", bold?, italic?, size?, font_color?:"RRGGBB", fill?:"RRGGBB", align?:"left|center|right", wrap?:bool, number_format?:"0.00"}
+"op":"set_format"      {sheet, range:"A1:C1", bold?, italic?, size?, font_color?:"RRGGBB", fill?:"RRGGBB", align?:"left|center|right", wrap?:bool, number_format?:"0.00"}  // range max 10000 cells — split larger areas
 "op":"add_sheet"       {name}
 "op":"rename_sheet"    {from, to}
 "op":"delete_sheet"    {name}
 "op":"set_col_width"   {sheet, col:"A", width}
 "op":"set_row_height"  {sheet, row, height}
-"op":"merge"/"unmerge" {sheet, range:"A1:B2"}
+"op":"merge"/"unmerge" {sheet, range:"A1:B2"}   // range max 10000 cells, within the Excel grid (XFD1048576)
 "op":"freeze"          {sheet, cell:"A2"}`,
 };
 

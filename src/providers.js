@@ -21,7 +21,6 @@ export const DEFAULT_PROVIDERS = {
     ],
     assistant: ["[data-message-author-role='assistant']"],
     user: ["[data-message-author-role='user']"],
-    user: ["[data-message-author-role='user']"],
     loggedOut: ["button[data-testid='login-button']", "a[href*='/auth/login']"],
     replyTimeoutMs: 300000,
   },
@@ -103,11 +102,19 @@ export function loadProviders() {
 export function saveCustomProvider({ url, name, plain = false, simple = false, delay = 0 } = {}) {
   if (!url) throw new Error('custom provider needs a URL');
   if (!/^[a-z]+:\/\//i.test(url)) url = 'https://' + url;
-  const parsed = new URL(url);
+  let parsed;
+  try { parsed = new URL(url); }
+  catch { throw new Error(`bad custom provider URL ${JSON.stringify(String(url).slice(0, 80))}`); }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')
+    throw new Error('custom provider URL must be http(s)');
   const defName = parsed.hostname.replace(/^www\./, '').split('.')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-') || 'custom';
   name = (name || defName).trim().toLowerCase().replace(/[^a-z0-9-]/g, '-') || defName;
   const providers = loadProviders();
-  while (providers[name]) name = name.replace(/-\d+$/, '') + '-' + Math.floor(Math.random() * 90 + 10);
+  let tries = 0;
+  while (providers[name]) {
+    if (++tries > 100) throw new Error(`too many providers named like "${name}" — pick a distinct name`);
+    name = name.replace(/-\d+$/, '') + '-' + Math.floor(Math.random() * 90 + 10);
+  }
   const entry = {
     label: `${name} (${parsed.hostname})`,
     newChat: url,

@@ -65,6 +65,13 @@ session — the `agent>` REPL and `[y/N]` approval prompts work there, so the
 terminal is never needed. Settings persist between runs
 (`gui-settings.json`). Closing the window shuts the server down.
 
+The GUI server binds to loopback only and requires a per-launch token
+(embedded in the page it serves) on every API call — this blocks
+DNS-rebinding and cross-site browser attacks. The token is **not** a barrier
+against other processes running as you on this machine: anything local can
+read the page and drive the API. Don't expose the port (e.g. via a tunnel or
+proxy) to a network.
+
 **＋ Custom…** next to the provider dropdown adds a company/work chat window
 (URL + name + behavior options) — saved to `providers.json`, same as the
 terminal chooser. In agent mode, a **"local AI runs alongside"** checkbox
@@ -175,8 +182,8 @@ summary in the terminal. Ctrl+C to stop.
 
 Built-in tools: `docs.snapshot` / `docs.apply_ops` / `docs.ops_spec` (Word/Excel),
 `fs.read` / `fs.list` / `fs.find` / `fs.search` / `fs.write` / `fs.download`,
-`shell.run`, `http.fetch`, `http.request` (any REST API — headers may read tokens
-from env vars via `"env:VARNAME"`, e.g. Azure DevOps/Agile, Jira), and
+`shell.run`, `code.run` (approved JavaScript worker), `http.fetch`, `http.request`
+(any REST API — headers may read tokens from env vars via `"env:VARNAME"`, e.g. Azure DevOps/Agile, Jira), and
 `ui.pick_files` (native file-explorer dialog so the agent can ask *you* which file),
 `agent.spawn` (parallel sub-agents in new tabs).
 
@@ -207,8 +214,16 @@ That is the supported way to add capabilities. It *can* also edit its own source
 in `src/` via `fs.write`/`shell.run` (approval-gated), but harness changes need a
 restart — prefer `tools/`.
 
-Dangerous actions (`shell.run`, `fs.write`, `fs.download`, non-GET `http.request`)
-ask for terminal approval unless `--yes`.
+Approval-gated actions (`code.run`, `tools.create`, file overwrites, non-GET `http.request`,
+GET `http.request` with `env:` headers to non-loopback targets, and
+delete-like `shell.run` commands) ask in the terminal/GUI unless `--yes`.
+A tool created by `tools.create` is approved once, at creation — its code
+then runs in-process on every call with no sandbox, no timeout, and no
+further prompts, so review the code at the creation prompt.
+The `code.run` prompt shows a 160-char prefix plus the total length — treat
+overlong snippets you can't fully review as a no. URLs with embedded
+credentials (`user:pass@host`) are rejected by the HTTP tools; put
+credentials in a header instead (`"env:VARNAME"` keeps them out of the chat).
 
 ## Local models (GGUF, offline, no browser)
 
@@ -351,13 +366,33 @@ If a site stops working, run `node src/app.js doctor --provider chatgpt` — it 
 ## Local demo / tests (no real AI needed)
 
 ```
+npm test                       # full e2e suite: mock chat + real Chrome, isolated profile
+npm run test:unit              # all browser-free checks below (fast; good for CI)
+npm run test:gui               # settings-window server smoke test (no browser)
+npm run test:security          # HTTP URL/SSRF guard checks (no browser)
+npm run test:regression        # targeted regressions: watchdogs, tools, doc ops
+```
+
+`npm test` starts the mock chat (mock/server.js) on its own port, drives every
+scenario through a throwaway Chrome profile (`.wh-work/e2e-profile`, dynamically
+allocated debug port — your real `.chrome-profile` is never touched), and asserts the resulting
+files. Scenarios: `budget` (xlsx ops), `hello` (docx ops), `fill`, `retry`
+(bad-JSON self-correction), `footerdecoy`, `captcha`, `loggedout`, `watch`
+(page auto-sends), `agent`, `agentbatch`, `agentsub`, `agentcompress`,
+`agentwatch`, `calibrate`, `doctor` — plus PDF text extraction, the scrubber,
+review regressions, and HTTP SSRF guard checks.
+Pass a scenario name to run just one: `node test/e2e.mjs budget`.
+`test/gui_smoke.mjs` (`npm run test:gui`) exercises the settings-window server,
+API authentication, and `buildArgv` mapping without a browser.
+
+Manual single-shot runs still work:
+
+```
 node mock/server.js                 # fake AI chat on http://127.0.0.1:8123
 node samples/make_samples.mjs       # writes test-files/ (checklist.docx, Budget.xlsx, Policy.pdf)
 node src/app.js edit test-files/Budget.xlsx --provider mock --url http://127.0.0.1:8123/ --ask "BUDGET update"
 node test/verify.mjs budget         # asserts the resulting file
 ```
-
-Scenarios: `budget`, `hello` (docx), `fill`, `retry` (bad-JSON self-correction), `watch` (`?scenario=watch` auto-sends from the page).
 
 ## Notes & limits
 

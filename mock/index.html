@@ -1,5 +1,5 @@
 // Mock AI chat page mimicking a provider DOM for end-to-end tests.
-// Serves at http://127.0.0.1:8123/ (any path). Scenario via ?scenario=watch
+// Serves at http://127.0.0.1:8123/ by default (MOCK_PORT can override it; any path). Scenario via ?scenario=watch
 // auto-submits a message shortly after load, simulating the user typing in
 // the browser while the tool runs in --watch mode.
 <!doctype html>
@@ -18,7 +18,7 @@
 <button data-testid="send-button">Send</button>
 <script>
   const log = document.getElementById('log');
-  const state = { turn: 0 };
+  const state = { turn: 0, retryBroken: false }; // retryBroken armed by RETRYTEST, consumed by the next TOOL FEEDBACK
   const qs = new URLSearchParams(location.search);
 
   function replyFor(prompt) {
@@ -52,20 +52,29 @@
       return 'Ready.\n```json\n{"action":"final","summary":"context acknowledged"}\n```';
     }
     if (qs.get('scenario') === 'agent') {
+      const self = location.origin + '/';
       const steps = [
         'Editing the budget.\n```json\n{"action":"tool","tool":"docs.apply_ops","args":{"file":"test-files/Budget.xlsx","ops":[{"op":"set_cell","sheet":"Sheet1","cell":"B2","value":4242},{"op":"set_format","sheet":"Sheet1","range":"A1","bold":true}]}}\n```',
         'Creating a reusable tool.\n```json\n{"action":"tool","tool":"tools.create","args":{"name":"notes.add","description":"Append a line to test-files/agent-note.txt","code":"const fs = await import(\'node:fs\'); fs.appendFileSync(\'test-files/agent-note.txt\', String(args.line) + String.fromCharCode(10)); return \'appended: \' + args.line;"}}\n```',
         'Using the new tool.\n```json\n{"action":"tool","tool":"notes.add","args":{"line":"agent was here"}}\n```',
-        'Hitting an API.\n```json\n{"action":"tool","tool":"http.request","args":{"url":"http://127.0.0.1:8123/"}}\n```',
-        'Downloading.\n```json\n{"action":"tool","tool":"fs.download","args":{"url":"http://127.0.0.1:8123/","path":"test-files/downloaded.html"}}\n```',
+        'Hitting an API.\n```json\n{"action":"tool","tool":"http.request","args":{"url":"' + self + '"}}\n```',
+        'Downloading.\n```json\n{"action":"tool","tool":"fs.download","args":{"url":"' + self + '","path":"test-files/downloaded.html"}}\n```',
         'All done.\n```json\n{"action":"final","summary":"edited Budget.xlsx, created notes.add tool, used it, made an API call, downloaded a file"}\n```',
       ];
       return steps[Math.min(state.turn - 1, steps.length - 1)];
     }
     const isPreamble = prompt.includes('REPLY FORMAT');
-    if (!isPreamble && prompt.includes('RETRYTEST')) {
-      if (state.turn <= 1) return 'Sure!\n```json\n{"ops":[{"op":"set_cell","sheet":"Sheet1","cell":"A1","value": BROKEN JSON HERE]\n```';
+    // COUPLING: this branch must be checked BEFORE RETRYTEST and stays armed
+    // exactly once. It relies on app.js retry feedback never echoing the
+    // original instruction — if feedback ever quotes the ask text, a prompt
+    // containing both would re-arm RETRYTEST and loop broken replies.
+    if (!isPreamble && prompt.includes('TOOL FEEDBACK') && state.retryBroken) {
+      state.retryBroken = false; // one-shot: a later session must re-arm via RETRYTEST
       return 'Fixed.\n```json\n{"ops":[{"op":"set_cell","sheet":"Sheet1","cell":"A1","value":"recovered"}],"notes":"second attempt"}\n```';
+    }
+    if (!isPreamble && prompt.includes('RETRYTEST')) {
+      state.retryBroken = true;
+      return 'Sure!\n```json\n{"ops":[{"op":"set_cell","sheet":"Sheet1","cell":"A1","value": BROKEN JSON HERE]\n```';
     }
     if (!isPreamble && prompt.includes('BUDGET')) {
       return 'Updating the budget.\n```json\n{"ops":[' +

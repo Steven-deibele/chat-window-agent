@@ -11,6 +11,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { bounded } from './util.js';
 
 export const MODELS_DIR = path.resolve('models');
 
@@ -154,11 +155,24 @@ export class LocalChat {
         const opts = { logLevel: lib.LlamaLogLevel?.error };
         if (gpu === false) opts.gpu = false;
         const llama = await lib.getLlama(opts).catch(() => lib.getLlama(gpu === false ? { gpu: false } : undefined));
-        const model = await llama.loadModel({ modelPath });
+        let lastPct = -5;
+        const model = await llama.loadModel({
+          modelPath,
+          onLoadProgress: (p) => {
+            // node-llama-cpp has passed a 0..1 fraction and, in other versions,
+            // a { total, loaded } object — accept both
+            const frac = typeof p === 'number' ? p
+              : (p && typeof p === 'object' && p.total) ? p.loaded / p.total : NaN;
+            const pct = Math.floor(frac * 100);
+            if (Number.isFinite(pct) && pct >= lastPct + 5) { lastPct = pct; this.log(`loading model… ${pct}%`); }
+          },
+        });
+        this.log('model file loaded — creating inference context…');
         const context = await model.createContext();
         this._shared = { lib, llama, model, context, owner: this };
         this._makeSession();
-        this.log(`model ready on ${gpu === false ? 'CPU' : `GPU (${llama.gpu || 'auto'})`} (${path.basename(modelPath)})`);
+        const ctxTokens = context?.contextSize ?? 'unknown';
+        this.log(`MODEL LOADED on ${gpu === false ? 'CPU' : `GPU (${llama.gpu || 'auto'})`}: ${path.basename(modelPath)} — context ${ctxTokens} tokens, ready for prompts`);
         return this;
       } catch (e) {
         lastErr = e;
@@ -181,21 +195,29 @@ export class LocalChat {
 
   async waitUntilReady() { /* model is loaded in start() */ }
 
-  bounded(p, ms, label) {
-    return Promise.race([
-      p,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`${label || 'local inference'} stalled (${ms / 1000}s)`)), ms)),
-    ]);
-  }
-
   /** Send a message, return the reply text. Same contract as AIChat.send. */
   async send(text) {
     const t0 = Date.now();
     let tokens = 0;
     let firstTokenAt = 0;
+    let lastTick = 0;
+    this.log('prompt sent — processing (first token can take a while on CPU)…');
     try {
-      const reply = await this.bounded(this.session.prompt(text, {
-        onToken: (t) => { if (!firstTokenAt) firstTokenAt = Date.now(); tokens += t.length; },
+      const reply = await bounded(this.session.prompt(text, {
+        onToken: (t) => {
+          const now = Date.now();
+          if (!firstTokenAt) {
+            firstTokenAt = now;
+            lastTick = now;
+            this.log(`first token after ${((now - t0) / 1000).toFixed(1)}s — generating…`);
+          }
+          tokens += t.length;
+          if (now - lastTick >= 5000) {
+            lastTick = now;
+            const rate = tokens / Math.max((now - firstTokenAt) / 1000, 0.001);
+            this.log(`generating… ${tokens} tokens, ${rate.toFixed(1)} tok/s`);
+          }
+        },
       }), this.timeoutMs, 'local model reply');
       const secs = (Date.now() - t0) / 1000;
       if (tokens > 0 && firstTokenAt) {

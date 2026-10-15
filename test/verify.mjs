@@ -48,7 +48,7 @@ if (scenario === 'budget') {
   check('agent B2 = 4242', x.sheet('Sheet1').getCell('B2').value === 4242, String(x.sheet('Sheet1').getCell('B2').value));
   check('agent A1 bold', x.sheet('Sheet1').getCell('A1').font?.bold === true);
   check('agent tool file created', fs.existsSync('tools/notes.add.js'));
-  check('agent tool ran (side effect)', fs.readFileSync(F('agent-note.txt'), 'utf8').includes('agent was here'));
+  check('agent tool ran (side effect)', fs.existsSync(F('agent-note.txt')) && fs.readFileSync(F('agent-note.txt'), 'utf8').includes('agent was here'));
   check('agent downloaded file', fs.existsSync(F('downloaded.html')) && fs.readFileSync(F('downloaded.html'), 'utf8').includes('Mock AI Chat'));
 } else {
   console.error('unknown scenario'); process.exit(2);

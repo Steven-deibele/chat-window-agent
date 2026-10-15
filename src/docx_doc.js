@@ -4,9 +4,18 @@
 import fs from 'node:fs';
 import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import JSZip from 'jszip';
+import { atomicWriteFile, runRegexWorker } from './util.js';
 
 const NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const W = (name) => `{${NS_W}}${name}`;
+const REGEX_TIMEOUT_MS = 5000;
+
+/** Run user-supplied regexes in a worker: RegExp is synchronous, so an
+ *  in-process timer cannot stop catastrophic backtracking. */
+async function regexMatchSpans(texts, pattern, count) {
+  const m = await runRegexWorker({ texts, pattern, count }, REGEX_TIMEOUT_MS);
+  return m.matches;
+}
 
 function esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -137,17 +146,24 @@ export class DocxDoc {
     // matcher(text) -> list of [start, end) spans
     const ts = [...p.getElementsByTagNameNS(NS_W, 't')];
     if (!ts.length) return 0;
+    // char offsets per text node, kept in a local Map — annotating the live
+    // DOM nodes (_base) leaks scratch state into the document tree
+    const bases = new Map();
     let base = 0;
-    for (const sp of ts) { sp._base = base; base += sp.textContent.length; }
+    for (const sp of ts) { bases.set(sp, base); base += sp.textContent.length; }
     const full = ts.map((t) => t.textContent).join('');
     const matches = matcher(full);
     if (!matches.length) return 0;
+    // matches are sorted and non-overlapping; char positions ascend across
+    // spans, so a single match pointer gives O(chars + matches)
+    let mi = 0;
     for (const t of ts) {
-      const s0 = t._base, e0 = t._base + t.textContent.length;
+      const s0 = bases.get(t), e0 = s0 + t.textContent.length;
       let out = '';
       for (let i = s0; i < e0; i++) {
-        const m = matches.find(([ms, me]) => i >= ms && i < me);
-        if (m) { if (i === m[0]) out += replacement; } else out += full[i];
+        while (mi < matches.length && matches[mi][1] <= i) mi++;
+        const m = mi < matches.length ? matches[mi] : null;
+        if (m && m[0] <= i) { if (i === m[0]) out += replacement; } else out += full[i];
       }
       t.textContent = out;
       if (/^\s|\s$/.test(out)) t.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'space', 'preserve');
@@ -155,14 +171,43 @@ export class DocxDoc {
     return matches.length;
   }
 
-  op_replace_text(op) {
+  async op_replace_text(op) {
+    // empty-string find would match at every position (and, with count=all,
+    // hang the literal builder forever) — reject up front. Note: not !op.find —
+    // find:0/false stringify to valid one-character literals.
+    if (op.find == null || String(op.find) === '')
+      throw new Error('replace_text needs a non-empty "find"');
+    const find = String(op.find);
     const count = op.count === 'first' ? 1 : Infinity;
-    const build = op.regex
-      ? (text) => { const re = new RegExp(op.find, 'g'); const out = []; let m; while ((m = re.exec(text))) { out.push([m.index, m.index + m[0].length]); if (m[0] === '') re.lastIndex++; if (out.length >= count) break; } return out; }
-      : (text) => { const out = []; let i = 0; while (out.length < count) { const j = text.indexOf(op.find, i); if (j < 0) break; out.push([j, j + op.find.length]); i = j + op.find.length; } return out; };
+    const paragraphs = this.paragraphs();
     let n = 0;
-    for (const p of this.paragraphs()) n += this.replaceInParagraph(p, build, op.replace);
-    if (!n) throw new Error(`no match for ${JSON.stringify(String(op.find).slice(0, 40))}`);
+    if (op.regex) {
+      // Hostile-input defense in depth: cap pattern size, compile once for a
+      // friendly syntax error, then execute in a terminable worker (ReDoS).
+      if (find.length > 500) throw new Error('replace_text regex too long (max 500 chars)');
+      try { new RegExp(find, 'g'); } catch (e) { throw new Error(`bad regex ${JSON.stringify(find.slice(0, 40))}: ${e.message}`); }
+      const spans = await regexMatchSpans(paragraphs.map((p) => DocxDoc.pText(p)), find, count);
+      for (let i = 0; i < paragraphs.length; i++)
+        n += this.replaceInParagraph(paragraphs[i], () => spans[i], op.replace);
+    } else {
+      // count is global across the document (same contract as the regex worker):
+      // 'first' = first occurrence overall, not first per paragraph.
+      let remaining = count;
+      const build = (text) => {
+        const out = [];
+        let i = 0;
+        while (out.length < remaining) {
+          const j = text.indexOf(find, i);
+          if (j < 0) break;
+          out.push([j, j + find.length]);
+          i = j + find.length;
+        }
+        remaining -= out.length;
+        return out;
+      };
+      for (const p of paragraphs) n += this.replaceInParagraph(p, build, op.replace);
+    }
+    if (!n) throw new Error(`no match for ${JSON.stringify(find.slice(0, 40))}`);
     return `replaced ${n} occurrence(s)`;
   }
 
@@ -272,6 +317,7 @@ export class DocxDoc {
     const xml = new XMLSerializer().serializeToString(this.doc);
     this.zip.file('word/document.xml', xml);
     const buf = await this.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-    fs.writeFileSync(dest || this.path, buf);
+    // atomic write: a failed save must never corrupt the user's document
+    await atomicWriteFile(dest || this.path, buf);
   }
 }

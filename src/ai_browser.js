@@ -4,6 +4,7 @@ import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { bounded } from './util.js';
 
 const DEBUG_PORT = process.env.WH_DEBUG_PORT || 9222;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -189,20 +190,11 @@ export class AIChat {
     return sub;
   }
 
-  /** Race a promise against a deadline so a stalled CDP call fails loudly
-   *  instead of freezing the session forever. */
-  bounded(p, ms, label) {
-    return Promise.race([
-      p,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`${label || 'operation'} stalled (${ms / 1000}s)`)), ms)),
-    ]);
-  }
-
   async findOne(selectors, { visible = true, chatInput = false } = {}) {
     for (const frame of this.page.frames()) {
       for (const sel of selectors) {
         try {
-          const handles = await this.bounded(frame.$$(sel), 10000, 'querySelectorAll');
+          const handles = await bounded(frame.$$(sel), 10000, 'querySelectorAll');
           for (const h of handles) {
             if (!visible) return { handle: h, selector: sel };
             if (chatInput) {
@@ -226,27 +218,24 @@ export class AIChat {
   }
 
   async evaluate(fn, ...args) {
-    return this.bounded(this.page.evaluate(fn, ...args), 20000, 'evaluate');
+    return bounded(this.page.evaluate(fn, ...args), 20000, 'evaluate');
   }
 
   /** Bounded keyboard helpers — a stalled CDP input dispatch must never
    *  freeze the session. */
   kbd(action, key, opts) {
-    return this.bounded(action === 'type' ? this.page.keyboard.type(key, opts) : this.page.keyboard[action](key), 30000, `keyboard.${action}`).catch((e) => this.log(`${e.message} (continuing)`));
+    return bounded(action === 'type' ? this.page.keyboard.type(key, opts) : this.page.keyboard[action](key), 30000, `keyboard.${action}`).catch((e) => this.log(`${e.message} (continuing)`));
   }
 
   /** Evaluate in the main frame, else in any sub-frame that can answer —
    *  corporate chat UIs often live inside an iframe. */
   async evalAnywhere(fn, ...args) {
-    const timed = (p) => Promise.race([
-      p,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('evaluate timeout (page busy or context destroyed)')), 15000)),
-    ]);
+    const timed = (p) => bounded(p, 15000, 'evaluate (page busy or context destroyed)');
     for (const frame of this.page.frames()) {
       try {
         const v = await timed(frame.evaluate(fn, ...args));
         if (v !== undefined && v !== null) return v;
-      } catch (e) { if (/timeout/.test(e.message)) this.log(`frame evaluate stalled: ${e.message}`); /* frame not accessible */ }
+      } catch (e) { if (/timeout|stalled/.test(e.message)) this.log(`frame evaluate stalled: ${e.message}`); /* frame not accessible */ }
     }
     return undefined;
   }

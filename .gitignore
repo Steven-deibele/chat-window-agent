@@ -8,3 +8,8 @@ providers.json
 models/
 memory/
 gui-settings.json
+*.diff
+# agent-created tools (tools/notes.add.js is a tracked test fixture used by
+# test/regression.mjs; anything else the agent drops here stays local)
+tools/*
+!tools/notes.add.js

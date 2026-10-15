@@ -5,19 +5,323 @@
 //   export async function run(args, ctx) { return 'result string or object'; }
 import fs from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
+import https from 'node:https';
+import dns from 'node:dns';
+import net from 'node:net';
+import zlib from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 const require = createRequire(import.meta.url);
-import { snapshotFile, kindOf } from '../reader.js';
+import { snapshotFile } from '../reader.js';
 import { applyOps, validateOps, OPS_SPEC } from '../ops.js';
 import { COMPUTER_TOOLS } from './computer.js';
+import { runWorker, runRegexWorker, atomicWriteFileSync } from '../util.js';
 
 const TOOLS_DIR = path.resolve('tools');
 const clip = (s, n = 4000) => {
   const t = typeof s === 'string' ? s : JSON.stringify(s, null, 2);
   return t.length > n ? t.slice(0, n) + `\n<TRUNCATED ${t.length - n} chars>` : t;
 };
+
+const MAX_REDIRECTS = 5;
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES = 20 * 1024 * 1024; // zip-bomb guard: enforced AFTER inflate
+const FETCH_TIMEOUT_MS = 30000; // a hanging server must fail, not freeze the session
+// Socket timeouts reset on activity, so a slow-drip server (1 byte / 29s)
+// would stall a fetch forever — this wall-clock deadline cannot be reset.
+const FETCH_DEADLINE_MS = 120000;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// Headers that must never follow a redirect to another origin (credentials).
+const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization', 'cookie', 'x-api-key']);
+
+/** Block cloud-metadata / link-local fetch targets: plain GETs need no user
+ *  approval, so SSRF to instance metadata would leak credentials silently.
+ *  Private LAN ranges (10/8, 172.16/12, 192.168/16, …) are intentionally
+ *  allowed — pointing the agent at the user's own services is a core use case
+ *  (accepted risk: a prompt-injected GET could probe the LAN). */
+export function assertFetchable(url) {
+  let u;
+  try { u = new URL(String(url)); } catch { throw new Error(`bad URL "${url}"`); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:')
+    throw new Error(`URL scheme "${u.protocol}" is not allowed (use http/https)`);
+  // userinfo is silently ignored by the hand-rolled request options below —
+  // fail loudly instead of sending an unauthenticated request (the old
+  // fetch() rejected credentialed URLs too). Use an Authorization header.
+  if (u.username || u.password)
+    throw new Error('URL credentials (user:pass@host) are not supported — pass credentials in a header instead');
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.$/, '');
+  if (host === 'metadata.google.internal' || (net.isIP(host) && isBlockedIp(host)))
+    throw new Error(`link-local/cloud-metadata address "${host}" is not allowed`);
+  return u;
+}
+
+function isBlockedIpv4(ip) {
+  const p = ip.split('.').map(Number);
+  // link-local / Alibaba metadata; 0.0.0.0/8 is "this host" (RFC 1122) and
+  // connects to loopback on several stacks — the whole block must not become
+  // a policy-bypass if loopback rules tighten
+  return (p[0] === 169 && p[1] === 254) || ip === '100.100.100.200' || p[0] === 0;
+}
+
+function ipv6Parts(ip) {
+  let s = ip.toLowerCase();
+  const embedded = /(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+  if (embedded) {
+    if (net.isIP(embedded[2]) !== 4) return null;
+    const b = embedded[2].split('.').map(Number);
+    s = embedded[1] + (((b[0] << 8) | b[1]).toString(16)) + ':' + (((b[2] << 8) | b[3]).toString(16));
+  }
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && left.length !== 8) || (halves.length === 2 && missing < 1)) return null;
+  const all = halves.length === 2 ? [...left, ...Array(missing).fill('0'), ...right] : left;
+  return all.length === 8 && all.every((h) => /^[0-9a-f]{1,4}$/.test(h)) ? all.map((h) => parseInt(h, 16)) : null;
+}
+
+function isBlockedIp(ip) {
+  const clean = ip.replace(/^\[|\]$/g, '').toLowerCase();
+  if (net.isIP(clean) === 4) return isBlockedIpv4(clean);
+  if (net.isIP(clean) !== 6) return false;
+  const p = ipv6Parts(clean);
+  // fail closed: if the address parses as IPv6 but our parser can't split it,
+  // treat it as blocked (covers zone-ids and exotic forms we don't model)
+  if (!p) return true;
+  if ((p[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  const zerosUpTo = (n) => p.slice(0, n).every((x) => x === 0);
+  if (zerosUpTo(8)) return true; // :: unspecified — same "this host" problem as 0.0.0.0
+  if (zerosUpTo(7) && p[7] === 1) return false; // ::1 loopback is fine (isLoopbackIp handles policy)
+  // IPv4-mapped (::ffff:w.x.y.z) and IPv4-compatible (::w.x.y.z, deprecated)
+  // embeddings defer to the IPv4 rules — :: and ::1 handled above must not
+  // reach this path (0.0.0.0/8 is blocked, and ::1 is not an embedding)
+  const embeddedV4 = zerosUpTo(5) && (p[5] === 0xffff || zerosUpTo(6));
+  if (embeddedV4) return isBlockedIpv4(`${p[6] >> 8}.${p[6] & 255}.${p[7] >> 8}.${p[7] & 255}`);
+  // Accepted gap: 6to4 (2002::/16), Teredo, and NAT64 (64:ff9b::/96) also
+  // embed IPv4 literals and could encode a blocked address, but reaching them
+  // requires relay/transition routing that essentially no target host has.
+  // Deliberately not modeled — revisit if transition mechanisms matter.
+  // AWS IPv6 instance metadata: fd00:ec2::254 exactly (all middle groups zero)
+  return p[0] === 0xfd00 && p[1] === 0x0ec2 && p.slice(2, 7).every((x) => x === 0) && p[7] === 0x0254;
+}
+
+/** 127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x — used to decide whether an
+ *  env:-header GET can skip confirmation (secrets may only leave unapproved
+ *  when every resolved address stays on this machine). */
+function isLoopbackIp(ip) {
+  const clean = ip.replace(/^\[|\]$/g, '').toLowerCase();
+  if (net.isIP(clean) === 4) return clean.split('.')[0] === '127';
+  if (net.isIP(clean) !== 6) return false;
+  const p = ipv6Parts(clean);
+  if (!p) return false; // exotic form: not provably loopback → require approval
+  const mappedV4 = p.slice(0, 5).every((x) => x === 0) && p[5] === 0xffff;
+  if (mappedV4) return (p[6] >> 8) === 127;
+  return p.slice(0, 7).every((x) => x === 0) && p[7] === 1; // ::1
+}
+
+async function resolveChecked(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.$/, '');
+  if (net.isIP(host)) {
+    if (isBlockedIp(host)) throw new Error(`link-local/cloud-metadata address "${host}" is not allowed`);
+    return [{ address: host, family: net.isIP(host) }];
+  }
+  if (host === 'metadata.google.internal')
+    throw new Error('link-local/cloud-metadata address "metadata.google.internal" is not allowed');
+  const addresses = await dns.promises.lookup(host, { all: true, verbatim: true });
+  if (!addresses.length) throw new Error(`DNS lookup for "${host}" returned no addresses`);
+  const blocked = addresses.find((a) => isBlockedIp(a.address));
+  if (blocked) throw new Error(`"${host}" resolves to link-local/cloud-metadata address "${blocked.address}" — not allowed`);
+  return addresses;
+}
+
+function decodeResponseBody(raw, encoding) {
+  const enc = String(encoding || '').split(';')[0].trim().toLowerCase();
+  // Enforce the decoded cap INSIDE zlib. Checking after gunzip/inflate would
+  // already have allowed a small response to allocate gigabytes.
+  const limit = { maxOutputLength: MAX_DECOMPRESSED_BYTES + 1 };
+  let out;
+  try {
+    if (enc === 'gzip' || enc === 'x-gzip') out = zlib.gunzipSync(raw, limit);
+    else if (enc === 'deflate') {
+      // Try zlib-wrapped first; fall back to raw deflate ONLY on a data error.
+      // The size guard must propagate: swallowing ERR_BUFFER_TOO_LARGE here and
+      // retrying raw would make a deflate bomb look like a corrupt header and
+      // return the compressed bytes, defeating maxOutputLength.
+      try { out = zlib.inflateSync(raw, limit); }
+      catch (e) {
+        if (e?.code === 'ERR_BUFFER_TOO_LARGE') throw e;
+        out = zlib.inflateRawSync(raw, limit);
+      }
+    }
+    else if (enc === 'br') out = zlib.brotliDecompressSync(raw, limit);
+    else out = raw;
+  } catch (e) {
+    if (e?.code === 'ERR_BUFFER_TOO_LARGE')
+      throw new Error(`response too large after decoding (max ${MAX_DECOMPRESSED_BYTES} bytes)`);
+    out = raw; // corrupt encoding header: return raw bytes, don't fail the fetch
+  }
+  if (out.length > MAX_DECOMPRESSED_BYTES)
+    throw new Error(`response too large after decoding (${out.length} bytes, max ${MAX_DECOMPRESSED_BYTES})`);
+  return out;
+}
+
+function requestAttempt(u, { method, headers, body, pin }) {
+  return new Promise((resolve, reject) => {
+    const transport = u.protocol === 'https:' ? https : http;
+    let responded = false; // true once response headers arrive
+    let done = false;
+    const finish = (e) => {
+      if (done) return;
+      done = true;
+      clearTimeout(deadline);
+      // connectPhase records whether response headers arrived. requestOnce
+      // additionally restricts retries to GET/HEAD because a consumed mutation
+      // may already have had side effects before the connection failed.
+      if (e.connectPhase === undefined) e.connectPhase = !responded;
+      reject(e);
+      req.destroy();
+    };
+    const req = transport.request({
+      protocol: u.protocol,
+      hostname: u.hostname.replace(/^\[|\]$/g, ''),
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: `${u.pathname}${u.search}`,
+      method,
+      headers,
+      // pin the address validated by resolveChecked (TOCTOU: no fresh DNS at
+      // connect time); hostname above still drives SNI and the Host header.
+      // Node's happy-eyeballs path passes all:true and expects an array.
+      lookup: (_h, o, cb) => (o && o.all ? cb(null, [{ address: pin.address, family: pin.family }]) : cb(null, pin.address, pin.family)),
+      // socket inactivity timeout covers both connect and streaming stalls
+      timeout: FETCH_TIMEOUT_MS,
+    }, (res) => {
+      responded = true;
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > MAX_RESPONSE_BYTES) return finish(new Error(`response too large (>${MAX_RESPONSE_BYTES} bytes)`));
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        if (done) return;
+        done = true;
+        clearTimeout(deadline);
+        try {
+          resolve({ status: res.statusCode || 0, headers: res.headers, body: decodeResponseBody(Buffer.concat(chunks), res.headers['content-encoding']) });
+        } catch (e) { e.connectPhase = false; reject(e); }
+      });
+      res.on('error', finish);
+    });
+    req.on('timeout', () => finish(new Error(`request timed out after ${FETCH_TIMEOUT_MS / 1000}s (${method} ${u.host})`)));
+    req.on('error', finish);
+    const deadline = setTimeout(() => finish(new Error(`fetch deadline exceeded (${FETCH_DEADLINE_MS / 1000}s, ${method} ${u.host})`)), FETCH_DEADLINE_MS);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+const SAFE_RETRY_METHODS = new Set(['GET', 'HEAD']); // safe per HTTP semantics; never auto-repeat mutations
+
+function requestOnce(u, { method, headers, body, addresses }) {
+  // Callers MAY pass addresses resolved+validated a moment ago (http.request's
+  // loopback judgment) so the approval decision and the connection use the
+  // SAME DNS answers — resolving twice would let rebinding DNS approve on a
+  // loopback answer and then connect to a public one (TOCTOU). Otherwise
+  // resolve + validate once here, then try each address in order: a dead
+  // first A/AAAA record must not fail the fetch when a sibling would work
+  return (addresses ? Promise.resolve(addresses) : resolveChecked(u.hostname)).then(async (addrs) => {
+    let lastErr;
+    for (const pin of addrs) {
+      try {
+        return await requestAttempt(u, { method, headers, body, pin });
+      } catch (e) {
+        // No response headers does NOT prove the server did not process the
+        // request. Retrying then can double-apply POST/PUT/DELETE side effects.
+        if (!SAFE_RETRY_METHODS.has(method) || !e.connectPhase) throw e;
+        lastErr = e;
+      }
+    }
+    throw lastErr;
+  });
+}
+
+function normalizeHeaders(headers) {
+  let out;
+  if (!headers) out = {};
+  else if (headers instanceof Headers) out = Object.fromEntries(headers.entries());
+  else if (Array.isArray(headers)) out = Object.fromEntries(headers);
+  else out = { ...headers };
+  // Host is derived from the target URL (and recomputed per redirect hop) — a
+  // caller-supplied one must never reach the wire
+  for (const k of Object.keys(out)) if (k.toLowerCase() === 'host') delete out[k];
+  return out;
+}
+
+async function fetchChecked(url, { method = 'GET', headers = {}, body, redirects = MAX_REDIRECTS, onRedirect, sensitiveHeaders, sensitiveApproved = false, addresses } = {}) {
+  let current = assertFetchable(url);
+  method = String(method || 'GET').toUpperCase();
+  headers = normalizeHeaders(headers);
+  const extraSensitive = new Set([...(sensitiveHeaders || [])].map((h) => String(h).toLowerCase()));
+  for (let hops = 0; ; hops++) {
+    // Resolve EVERY hop here and hand the addresses to requestOnce, so the
+    // connection pins the same resolution the guards below judge. (Hop 0 may
+    // reuse the caller's resolution, e.g. http.request's loopback judgment.)
+    const addrs = (hops === 0 && addresses) ? addresses : await resolveChecked(current.hostname);
+    // Env-backed secrets that skipped approval ("every address stays on this
+    // machine") must not ride a redirect to a hop whose resolution is no
+    // longer all-loopback — a same-origin redirect re-resolves DNS, so the
+    // hop-1 judgment is not implied by hop 0's. User-APPROVED sends keep
+    // their headers (the user accepted the target); the cross-origin strip
+    // below still applies to both kinds.
+    if (hops > 0 && extraSensitive.size && !sensitiveApproved && !addrs.every((a) => isLoopbackIp(a.address))) {
+      headers = { ...headers };
+      for (const h of Object.keys(headers)) if (extraSensitive.has(h.toLowerCase())) delete headers[h];
+    }
+    const res = await requestOnce(current, { method, headers, body, addresses: addrs });
+    const location = Array.isArray(res.headers.location) ? res.headers.location[0] : res.headers.location;
+    if (!REDIRECT_STATUSES.has(res.status) || !location) return res;
+    if (hops >= redirects) throw new Error(`too many redirects (>${redirects})`);
+    const next = assertFetchable(new URL(location, current));
+    if (current.protocol === 'https:' && next.protocol === 'http:')
+      throw new Error(`refusing insecure redirect from ${current.origin} to ${next.origin}`);
+    // Pass the CURRENT method: a 301/302/303 below may already have converted
+    // an earlier POST to GET, and later hops must not prompt as mutating.
+    if (onRedirect && !(await onRedirect(current, next, res.status, method))) {
+      // surface an explicit denial — returning the 3xx body would make the
+      // denial indistinguishable from the server's own redirect response
+      const err = new Error(`redirect to ${next.origin} was not approved`);
+      err.redirectDenied = true;
+      throw err;
+    }
+    if ([301, 302, 303].includes(res.status) && method !== 'GET' && method !== 'HEAD') {
+      method = 'GET';
+      body = undefined;
+      headers = { ...headers };
+      for (const h of Object.keys(headers)) if (/^(content-|host$)/i.test(h)) delete headers[h];
+    }
+    // credentials must never follow a redirect to another origin; Host must be
+    // recomputed for the target too. Env-expanded names are caller-supplied.
+    if (next.origin !== current.origin) {
+      headers = { ...headers };
+      for (const h of Object.keys(headers)) {
+        const name = h.toLowerCase();
+        if (name === 'host' || SENSITIVE_HEADERS.has(name) || extraSensitive.has(name)) delete headers[h];
+      }
+    }
+    current = next;
+  }
+}
+
+function responseText(res) {
+  const ct = String(res.headers['content-type'] || '');
+  const charset = /charset=([^;]+)/i.exec(ct)?.[1]?.trim() || 'utf-8';
+  try { return new TextDecoder(charset).decode(res.body); }
+  catch { return new TextDecoder('utf-8').decode(res.body); }
+}
 
 /** Chat UIs emit invisible characters (non-breaking spaces, zero-width, soft
  *  hyphens) that break commands and file paths. Normalize aggressively. */
@@ -57,6 +361,52 @@ function isDeleteCmd(cmd) {
 }
 
 // --- built-in tools -----------------------------------------------------------
+const CODE_RUN_TIMEOUT_MS = 30000;
+
+/** Execute an approved snippet in a worker so timeout actually terminates it.
+ *  This is NOT a privilege sandbox: the worker intentionally gets require(),
+ *  fs/network-capable modules, and a copy of the environment. code.run must
+ *  confirm before reaching this helper. */
+async function runCodeSnippet(code) {
+  // logs stream in live (type:'log') so a timeout still returns everything the
+  // snippet printed before hanging — a single terminal message would lose the
+  // output needed to debug the hang
+  const logs = [];
+  // A snippet logging in a tight loop would otherwise flood parent memory for
+  // the full timeout — cap the buffer, note the truncation once.
+  let logBytes = 0;
+  let logsTruncated = false;
+  const pushLogLine = (line) => {
+    if (logsTruncated) return;
+    if (logBytes + line.length > 200_000 || logs.length >= 10_000) {
+      logsTruncated = true;
+      logs.push('(code.run log output truncated)');
+      return;
+    }
+    logBytes += line.length;
+    logs.push(line);
+  };
+  return runWorker(
+    new URL('./code_worker.js', import.meta.url),
+    { code, cwd: path.resolve('.'), env: process.env, timeoutMs: CODE_RUN_TIMEOUT_MS },
+    {
+      timeoutMs: CODE_RUN_TIMEOUT_MS,
+      onMessage: (m) => {
+        if (m.type === 'log') { pushLogLine(m.line); return undefined; }
+        return { ...m, logs };
+      },
+      onTimeout: () => ({ status: 'timeout', logs }),
+      onError: (e) => ({ status: 'throw', error: e.message, stack: '', logs }),
+      onExit: (n) => ({
+        status: 'throw',
+        error: n === 0 ? 'worker exited before returning a result' : `worker exited with code ${n}`,
+        stack: '',
+        logs,
+      }),
+    },
+  );
+}
+
 const BUILTINS = [
   {
     meta: {
@@ -72,44 +422,29 @@ const BUILTINS = [
   },
   {
     meta: {
-      name: 'code.run', description: 'Run a JavaScript snippet IN-PROCESS (Node vm) and return console output + result. Use this instead of writing .cjs scripts + shell.run for computation, data munging, and file fixes — no extension/ESM issues, no npm needed. require() works, import("...") works (bare packages and file paths), module/exports exist. Delete-like fs calls still ask approval.',
+      name: 'code.run',
+      description: 'Run a PRIVILEGED JavaScript snippet in a worker and return console output + result. Use for computation, data munging, and file fixes. require() works (bare packages and file paths), module/exports exist, fetch is available. Dynamic import() is unsupported; use require(). Every run asks approval unless --yes (the prompt shows a 160-char prefix + total length — keep snippets short enough to review); a 30s timeout terminates the worker.',
       params: { code: 'JavaScript (return a value or console.log)' },
+      dangerous: true,
     },
     async run(args, ctx) {
       if (!args?.code) throw new Error('need "code"');
       const code = deInvisible(args.code);
-      if (/unlinkSync|rmSync|rmdirSync|\.unlink\(|\.rmdir\(|fs\.rm\(/.test(code) && !await ctx.confirm('code.run contains delete-like fs calls')) return 'DENIED by user';
-      const logs = [];
-      const moduleShim = { exports: {} };
-      const sandbox = {
-        console: { log: (...a) => logs.push(a.map(String).join(' ')), error: (...a) => logs.push('ERR ' + a.map(String).join(' ')), warn: (...a) => logs.push('WARN ' + a.map(String).join(' ')) },
-        require: createRequire(path.resolve('.')),
-        process: { env: process.env, platform: process.platform, cwd: () => process.cwd() },
-        setTimeout, clearTimeout, Buffer, __dirname: path.resolve('.'),
-        module: moduleShim, exports: moduleShim.exports,
-        fetch, URL, URLSearchParams, TextEncoder, TextDecoder,
-      };
-      const vm = await import('node:vm');
-      // let snippets use import('...') — bare specifiers via the host loader,
-      // relative/absolute paths resolved against cwd (ESM file URLs)
-      const importModuleDynamically = (specifier) => {
-        const isPath = /^\.{1,2}[\\/]/.test(specifier) || path.isAbsolute(specifier);
-        return import(isPath ? pathToFileURL(path.resolve(specifier)).href : specifier);
-      };
-      const result = await new Promise((resolve) => {
-        let done = false;
-        const finish = (v) => { if (!done) { done = true; resolve(v); } };
-        const t = setTimeout(() => finish('(code.run timed out after 30s)'), 30000);
-        try {
-          const script = new vm.Script(`(async () => {\n${code}\n})()`, { importModuleDynamically });
-          Promise.resolve(script.runInNewContext(sandbox, { timeout: 30000 }))
-            .then((v) => { clearTimeout(t); finish(v); })
-            .catch((e) => { clearTimeout(t); finish(`THREW: ${e.message}\n${String(e.stack || '').split('\n').slice(0, 3).join('\n')}`); });
-        } catch (e) { clearTimeout(t); finish(`SYNTAX ERROR: ${e.message}`); }
-      });
+      // exclude '.': obj.import(...) is a method call, not dynamic import.
+      // Best-effort UX guard only (comment tricks can evade it) — the worker
+      // is approval-gated, not a sandbox.
+      if (/(?:^|[^\w$.])import\s*\(/.test(code))
+        throw new Error('dynamic import() is not supported in code.run — use require() instead (a string/comment containing the text "import(" trips this guard too — reword or escape it)');
+      const preview = code.replace(/\s+/g, ' ').slice(0, 160);
+      if (!await ctx.confirm(`code.run privileged JavaScript (${code.length} chars): ${preview}`))
+        return 'DENIED by user';
+      const result = await runCodeSnippet(code);
       const out = [];
-      if (logs.length) out.push(logs.join('\n'));
-      if (result !== undefined) out.push(`RESULT: ${typeof result === 'string' ? result : JSON.stringify(result)}`);
+      if (result.logs?.length) out.push(result.logs.join('\n'));
+      if (result.status === 'timeout') out.push(`(code.run timed out after ${CODE_RUN_TIMEOUT_MS / 1000}s; worker terminated)`);
+      else if (result.status === 'syntax') out.push(`SYNTAX ERROR: ${result.error}`);
+      else if (result.status === 'throw') out.push(`THREW: ${result.error}${result.stack ? `\n${result.stack}` : ''}`);
+      else if (result.result !== undefined) out.push(`RESULT: ${result.result}`);
       return clip(out.join('\n') || '(no output)', 5000);
     },
   },
@@ -129,9 +464,12 @@ const BUILTINS = [
     },
     async run(args) {
       if (!args?.query) throw new Error('need "query"');
-      const res = await fetch('https://duckduckgo.com/html/?q=' + encodeURIComponent(deInvisible(args.query)), { headers: { 'user-agent': 'Mozilla/5.0' } });
-      if (!res.ok) return `HTTP ${res.status}`;
-      const html = await res.text();
+      // guarded: same timeout/size/SSRF rails as the http tools
+      const res = await fetchChecked('https://duckduckgo.com/html/?q=' + encodeURIComponent(deInvisible(args.query)), {
+        method: 'GET', headers: { 'user-agent': 'Mozilla/5.0' },
+      });
+      if (res.status < 200 || res.status >= 300) return `HTTP ${res.status}`;
+      const html = responseText(res);
       const out = [];
       const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
       let m; const seen = new Set();
@@ -225,7 +563,6 @@ const BUILTINS = [
     async run(args) {
       if (!args?.pattern) throw new Error('need "pattern"');
       const root = path.resolve(deInvisible(args.root || '.'));
-      const rootAbs = path.isAbsolute(deInvisible(args.root || '.')) || args.root === undefined ? root : root;
       const rx = new RegExp('^' + deInvisible(args.pattern).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/\\\\]*').replace(/\u0001/g, '.*').replace(/\?/g, '.') + '$', 'i');
       const out = [];
       const NOISE = new Set(['node_modules', '.git', '.chrome-profile', 'AppData', 'AppDataLocal', 'go-build', '.cache']);
@@ -249,6 +586,11 @@ const BUILTINS = [
     },
     async run(args) {
       if (!args?.pattern) throw new Error('need "pattern"');
+      // defense in depth: cap the pattern like replace_text (500 chars)
+      const pattern = deInvisible(args.pattern);
+      if (pattern.length > 500) throw new Error('search pattern too long (max 500 chars)');
+      // friendly syntax error up front (the worker's message would be raw)
+      try { new RegExp(pattern, 'i'); } catch (e) { throw new Error(`bad search pattern ${JSON.stringify(pattern.slice(0, 40))}: ${e.message}`); }
       const root = path.resolve(deInvisible(args.root || '.'));
       const gRx = args.glob ? new RegExp('^' + deInvisible(args.glob).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$') : null;
       const files = [];
@@ -263,15 +605,39 @@ const BUILTINS = [
         }
       };
       if (fs.statSync(root).isFile()) files.push(root); else walk(root, 0);
-      const re = new RegExp(deInvisible(args.pattern), 'i');
       const out = [];
+      // The user regex runs in a terminable worker, not on the main thread
+      // (same ReDoS isolation as replace_text). Batch many files per worker:
+      // one spawn per file costs ~7ms, which dominates on large trees. The
+      // worker protocol is index-based, so concatenating the batch's lines and
+      // keeping a global-index -> (file, line) map preserves the exact
+      // file-by-file output order of the walk.
+      const BATCH_MAX_FILES = 64, BATCH_MAX_BYTES = 4_000_000;
+      let bTexts = [], bMap = [], bFiles = 0, bBytes = 0;
+      const flush = async () => {
+        if (!bFiles) return;
+        const { hits } = await runRegexWorker({ mode: 'test', texts: bTexts, pattern, flags: 'i' });
+        for (const i of hits) {
+          if (out.length >= 200) break;
+          const { entry, line } = bMap[i];
+          out.push(`${path.resolve(entry.f)}:${line + 1}: ${entry.lines[line].trim().slice(0, 160)}`);
+        }
+        bTexts = []; bMap = []; bFiles = 0; bBytes = 0;
+      };
       for (const f of files.slice(0, 800)) {
+        if (out.length >= 200) break;
+        let lines, size;
         try {
-          if (fs.statSync(f).size > 2_000_000) continue;
-          const lines = fs.readFileSync(f, 'utf8').split('\n');
-          lines.forEach((l, i) => { if (re.test(l) && out.length < 200) out.push(`${path.resolve(f)}:${i + 1}: ${l.trim().slice(0, 160)}`); });
-        } catch { /* unreadable file */ }
+          size = fs.statSync(f).size;
+          if (size > 2_000_000) continue;
+          lines = fs.readFileSync(f, 'utf8').split('\n');
+        } catch { continue; /* unreadable file */ }
+        if (bFiles && (bFiles >= BATCH_MAX_FILES || bBytes + size > BATCH_MAX_BYTES)) await flush();
+        const entry = { f, lines };
+        for (let i = 0; i < lines.length; i++) { bTexts.push(lines[i]); bMap.push({ entry, line: i }); }
+        bFiles++; bBytes += size;
       }
+      await flush();
       return out.length ? out.join('\n') : `(no matches under ${root})`;
     }
   },
@@ -286,7 +652,7 @@ const BUILTINS = [
       try { overwrite = fs.statSync(dest).size > 0; } catch { /* new file */ }
       if (overwrite && !await ctx.confirm(`fs.write OVERWRITE ${dest}`)) return 'DENIED by user';
       fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, String(args.content ?? ''));
+      atomicWriteFileSync(dest, String(args.content ?? ''));
       return `wrote ${dest}`;
     }
   },
@@ -322,9 +688,10 @@ const BUILTINS = [
   {
     meta: { name: 'http.fetch', description: 'HTTP GET a URL, return the response body as text (truncated).', params: { url: 'http(s) URL' } },
     async run(args) {
-      const res = await fetch(args.url);
-      const body = await res.text();
-      return `HTTP ${res.status} ${res.headers.get('content-type') || ''}\n${clip(body, 5000)}`;
+      assertFetchable(args.url);
+      const res = await fetchChecked(args.url);
+      const body = responseText(res);
+      return `HTTP ${res.status} ${res.headers['content-type'] || ''}\n${clip(body, 5000)}`;
     },
   },
   {
@@ -335,36 +702,92 @@ const BUILTINS = [
     },
     async run(args, ctx) {
       const method = (args.method || 'GET').toUpperCase();
+      const url = assertFetchable(args.url);
       const headers = {};
+      const envHeaderNames = new Set();
+      let usesEnvHeader = false;
       for (const [k, v] of Object.entries(args.headers || {})) {
-        headers[k] = typeof v === 'string' && v.startsWith('env:') ? (process.env[v.slice(4)] ?? '') : v;
+        if (typeof v === 'string' && v.startsWith('env:')) {
+          usesEnvHeader = true;
+          envHeaderNames.add(k.toLowerCase());
+          const envName = v.slice(4);
+          // missing var must fail loudly: silently sending an empty
+          // Authorization header changes server semantics and hides the typo
+          if (process.env[envName] === undefined) throw new Error(`env var "${envName}" is not set`);
+          headers[k] = process.env[envName];
+        } else headers[k] = v;
       }
-      if (method === 'DELETE' && !(await ctx.confirm(`http.request DELETE ${args.url}`))) return 'DENIED by user (DELETE needs approval)';
+      // GET needs no approval, but env:-expanded headers carry secrets: a
+      // prompt-injected GET could exfiltrate any env var without a prompt
+      // unless the target stays on this machine. Judge by RESOLVED addresses,
+      // not the hostname string: a hosts-file remap of "localhost" to a
+      // public IP must not skip the prompt. All addresses must be loopback —
+      // a mixed A/AAAA answer means the secret could leave the machine.
+      let loopback = false;
+      let addrs = null;
+      try {
+        addrs = await resolveChecked(url.hostname);
+        loopback = addrs.length > 0 && addrs.every((a) => isLoopbackIp(a.address));
+      } catch { /* unresolvable/blocked: require approval; fetchChecked reports the real error */ }
+      const why = method !== 'GET' && method !== 'HEAD' ? method
+        : usesEnvHeader && !loopback ? 'GET sending env: header values' : null;
+      if (why && !(await ctx.confirm(`http.request ${why} ${args.url}`))) return `DENIED by user (${why} needs approval)`;
       let body = args.body;
       if (body !== undefined && typeof body === 'object') { body = JSON.stringify(body); headers['content-type'] = headers['content-type'] || 'application/json'; }
-      const res = await fetch(args.url, { method, headers, body });
-      const text = await res.text();
+      let res;
+      try {
+        res = await fetchChecked(args.url, {
+          method, headers, body,
+          // reuse the resolution that judged loopback: re-resolving here would
+          // let rebinding DNS approve on a 127.0.0.1 answer and connect to a
+          // public IP (TOCTOU). Redirect hops resolve fresh per hop.
+          addresses: addrs ?? undefined,
+          sensitiveHeaders: envHeaderNames,
+          // the user confirmed this request: env headers may follow same-origin
+          // redirects (cross-origin strips them regardless). When approval was
+          // SKIPPED (all-loopback judgment), fetchChecked re-judges every hop.
+          sensitiveApproved: why !== null,
+          onRedirect: async (from, to, status, hopMethod) => {
+            if (hopMethod !== 'GET' && hopMethod !== 'HEAD') return ctx.confirm(`http.request redirect ${status} ${from} -> ${to}`);
+            // Env-backed secrets are stripped by fetchChecked on any origin
+            // change; still ask because the request itself crosses a trust boundary.
+            if (usesEnvHeader && to.origin !== from.origin)
+              return ctx.confirm(`http.request redirect ${status} ${from} -> ${to} (env: header values will be omitted)`);
+            return true;
+          },
+        });
+      } catch (e) {
+        if (e.redirectDenied) return 'DENIED by user (redirect needs approval)';
+        throw e;
+      }
+      const text = responseText(res);
       let out = text;
       try { out = JSON.stringify(JSON.parse(text), null, 2); } catch { /* not json */ }
-      return `HTTP ${res.status} ${res.headers.get('content-type') || ''}\n${clip(out, 6000)}`;
+      return `HTTP ${res.status} ${res.headers['content-type'] || ''}\n${clip(out, 6000)}`;
     },
   },
   {
     meta: {
-      name: 'fs.download', description: 'Download a URL to a file on disk (binary-safe: pdf/xlsx/zip/images).', params: { url: 'URL', path: 'destination path' }, dangerous: true,
+      name: 'fs.download', description: 'Download a URL to a file on disk (binary-safe: pdf/xlsx/zip/images; max 10MB on the wire, 20MB after decompression — larger files need curl/browser outside the agent).', params: { url: 'URL', path: 'destination path' }, dangerous: true,
     },
     async run(args, ctx) {
       if (!args?.url || !args?.path) throw new Error('need "url" and "path"');
+      assertFetchable(args.url);
       const dest = path.resolve(deInvisible(args.path));
       let overwrite = false;
       try { overwrite = fs.statSync(dest).size > 0; } catch { /* new file */ }
       if (overwrite && !await ctx.confirm(`fs.download OVERWRITE ${dest}`)) return 'DENIED by user';
-      const res = await fetch(args.url);
-      if (!res.ok) return `HTTP ${res.status}`;
-      const buf = Buffer.from(await res.arrayBuffer());
-      fs.mkdirSync(path.dirname(path.resolve(args.path)), { recursive: true });
-      fs.writeFileSync(path.resolve(args.path), buf);
-      return `saved ${buf.length} bytes -> ${path.resolve(args.path)}`;
+      // NOTE: downloads share the 10MB fetch cap (MAX_RESPONSE_BYTES) — larger
+      // files must be fetched outside the agent (curl/browser) by design
+      const res = await fetchChecked(args.url);
+      if (res.status < 200 || res.status >= 300) return `HTTP ${res.status}`;
+      const buf = res.body;
+      // everything uses dest: the overwrite check/approval above covers the
+      // deInvisibled path, so the bytes must land there too — writing the raw
+      // path would let an invisible-char path bypass the approved target
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      atomicWriteFileSync(dest, buf);
+      return `saved ${buf.length} bytes -> ${dest}`;
     },
   },
   {
@@ -451,15 +874,27 @@ const BUILTINS = [
       description: `Create a new tool (or overwrite one you made before) and make it immediately usable. Persisted to tools/<name>.js, auto-loaded in future runs.
 "code" is a JS function body using (args, ctx); it may use top-level await, node: imports, and must return the result string/object. ctx has { log(msg), confirm(msg) (dangerous actions), cwd }.`,
       params: { name: 'lowercase-dots name', description: 'one-line description', code: 'JS function body', params: 'optional {arg: help}' },
+      dangerous: true,
     },
-    async run(args) {
+    async run(args, ctx) {
       if (!args?.name || !args?.code) throw new Error('need "name" and "code"');
       const name = String(args.name).toLowerCase().replace(/[^a-z0-9.-]/g, '-');
       if (!/^[a-z0-9][a-z0-9.-]*$/.test(name)) throw new Error('bad tool name');
+      if (BUILTINS.some((b) => b.meta.name.toLowerCase() === name))
+        throw new Error(`"${name}" is a built-in tool — pick a different name (built-ins cannot be overwritten)`);
+      // A created tool runs UNGATED in the main process on every call — no
+      // sandbox, no timeout, no per-call confirm. Creation is the only choke
+      // point, so approve the code here like code.run (same preview contract).
+      const code = String(args.code);
+      const preview = code.replace(/\s+/g, ' ').slice(0, 160);
+      if (!await ctx.confirm(`tools.create "${name}" — runs WITHOUT further approval on every call (${code.length} chars): ${preview}`))
+        return 'DENIED by user';
       const meta = { name, description: String(args.description || name), params: args.params || {} };
-      const src = `// created by chat-window-agent agent\nexport const meta = ${JSON.stringify(meta, null, 2)};\nexport async function run(args, ctx) {\n${args.code}\n}\n`;
+      const src = `// created by chat-window-agent agent\nexport const meta = ${JSON.stringify(meta, null, 2)};\nexport async function run(args, ctx) {\n${code}\n}\n`;
       fs.mkdirSync(TOOLS_DIR, { recursive: true });
-      fs.writeFileSync(path.join(TOOLS_DIR, `${name}.js`), src);
+      // atomic like every other write path: a crashed save must not leave a
+      // truncated tool file that breaks loadUserTools on the next run
+      atomicWriteFileSync(path.join(TOOLS_DIR, `${name}.js`), src);
       registry.registerFile(path.join(TOOLS_DIR, `${name}.js`)); // hot-load; errors surface to the AI
       return `tool "${name}" created and registered. Test it now with {"action":"tool","tool":"${name}"}`;
     },
@@ -480,12 +915,19 @@ class Registry {
   }
 
   registerFile(file) {
+    const name = path.basename(file, '.js');
+    // built-ins live in the same Map — never let a file shadow one (the
+    // tools.create tool enforces this too, but a hand-placed file must not
+    // slip through either: a shadowed builtin would silently swap a trusted
+    // implementation for arbitrary code mid-session).
+    // NOTE: lowercase compare — Windows/macOS filesystems are case-insensitive,
+    // so FS.READ.js would otherwise shadow fs.read on those platforms.
+    if (BUILTINS.some((b) => b.meta.name.toLowerCase() === name.toLowerCase()))
+      throw new Error(`refusing to load ${file}: "${name}" is a built-in tool`);
     const mod = import(pathToFileURL(file).href + `?t=${Date.now()}`); // cache-bust for hot reload
-    const self = this;
     // registration is async; surface errors to the caller of run()
-    this.tools.set(path.basename(file, '.js'), { pending: mod, file });
-    void mod.then(() => {}, () => {});
-    void self;
+    this.tools.set(name, { pending: mod, file });
+    void mod.catch(() => {});
   }
 
   async get(name) {
@@ -518,7 +960,6 @@ class Registry {
 }
 
 BUILTINS.push(...COMPUTER_TOOLS); // browser.* / desktop.* computer-use tools
-BUILTINS.forEach((t) => { /* pre-resolve builtins so get() is sync-safe */ });
 export { sysInfo };
 export const registry = new Registry();
 for (const b of BUILTINS) registry.tools.set(b.meta.name, b);

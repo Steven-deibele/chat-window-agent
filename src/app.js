@@ -983,8 +983,23 @@ function defaultProfile() {
   return path.resolve('.chrome-profile');
 }
 
-main().catch((e) => {
+main().then(async (ret) => {
+  // gui mode resolves with a live http.Server — the process must stay up
+  if (ret && typeof ret.listen === 'function') return;
+  // the shared readline interface pins stdin and would keep the event loop
+  // alive after the REPL breaks — release it so the process can actually exit
+  try { (await import('./picker.js')).closePrompt(); } catch { /* not loaded */ }
+  // same drain bound as the error path: teardown disconnects CDP in finally,
+  // but a future path that resolves main() with stray handles must not hang
+  setTimeout(() => process.exit(process.exitCode ?? 0), 3000).unref();
+}).catch(async (e) => {
+  // NOTE: no process.exit() here — it would terminate before the awaited
+  // cleanup below runs. exitCode lets the loop drain first. But a mid-session
+  // throw can leave Chrome/CDP handles pinning the loop, so bound the drain:
+  // if the process is still alive after 3s, force it out.
+  setTimeout(() => process.exit(1), 3000).unref();
   console.error(`\x1b[31m${e.message}\x1b[0m`);
   recordError('fatal', e?.stack || e?.message);
-  process.exit(1);
+  try { (await import('./picker.js')).closePrompt(); } catch { /* not loaded */ }
+  process.exitCode = 1;
 });

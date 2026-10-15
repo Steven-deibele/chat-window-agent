@@ -1,8 +1,33 @@
 // Excel (.xlsx/.xlsm) reading + editing via exceljs.
 // Note: exceljs round-trips most content but drops some exotic artifacts
 // (pivot charts, some shapes). Timestamped backups are always kept.
-import fs from 'node:fs';
 import ExcelJS from 'exceljs';
+import { atomicWriteFile } from './util.js';
+
+const EXCEL_MAX_COL = 16384; // XFD
+const EXCEL_MAX_ROW = 1048576;
+
+function checkedCell(ref, label = 'cell') {
+  const m = /^\$?([A-Z]+)\$?(\d+)$/i.exec(String(ref || '').trim());
+  if (!m) throw new Error(`bad ${label} ref "${ref}"`);
+  const col = colToNum(m[1]);
+  const row = +m[2];
+  if (row < 1 || row > EXCEL_MAX_ROW || col > EXCEL_MAX_COL)
+    throw new Error(`${label} "${ref}" is outside the Excel grid (max XFD${EXCEL_MAX_ROW})`);
+  return { row, col };
+}
+
+/** insert/delete rows/cols: exceljs is 1-based and silently misbehaves on
+ *  0/negative/huge positions — validate like the cell/range refs. */
+function checkedSplice(op, max) {
+  const at = Number(op.at);
+  if (!Number.isInteger(at) || at < 1 || at > max)
+    throw new Error(`${op.op} needs an integer "at" between 1 and ${max}, got ${JSON.stringify(op.at)}`);
+  const count = op.count === undefined ? 1 : Number(op.count);
+  if (!Number.isInteger(count) || count < 1 || count > 10000)
+    throw new Error(`${op.op} needs an integer "count" between 1 and 10000, got ${JSON.stringify(op.count)}`);
+  return { at, count };
+}
 
 function cellText(cell) {
   const v = cell.value;
@@ -67,12 +92,28 @@ export class XlsxDoc {
     return out;
   }
 
-  rangeCells(ws, range) {
-    // "B2" or "A1:C10"
-    const m = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/i.exec(String(range || '').trim());
+  checkedRange(range) {
+    // "B2" or "A1:C10" (absolute "$A$1:$B$2" forms accepted like checkedCell)
+    const m = /^\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?$/i.exec(String(range || '').trim());
     if (!m) throw new Error(`bad range "${range}" (use "B2" or "A1:C10")`);
     const c1 = colToNum(m[1]), r1 = +m[2];
     const c2 = m[3] ? colToNum(m[3]) : c1, r2 = m[4] ? +m[4] : r1;
+    // Excel's own grid limits — clearer error than a giant allocation or a
+    // silently discarded row-zero edit downstream
+    if (r1 < 1 || r2 < 1 || c1 > EXCEL_MAX_COL || c2 > EXCEL_MAX_COL || r1 > EXCEL_MAX_ROW || r2 > EXCEL_MAX_ROW)
+      throw new Error(`range "${range}" is outside the Excel grid (max XFD${EXCEL_MAX_ROW})`);
+    const total = (Math.abs(r2 - r1) + 1) * (Math.abs(c2 - c1) + 1);
+    if (total > 10000) throw new Error(`range "${range}" covers ${total} cells — too large (max 10000); split it into smaller ranges`);
+    // ref: normalized form for exceljs — uppercase (it rejects lowercase) and
+    // corners sorted (it does not normalize reversed refs like "C10:A1")
+    const [ra, rb] = [Math.min(r1, r2), Math.max(r1, r2)];
+    const [ca, cb] = [Math.min(c1, c2), Math.max(c1, c2)];
+    const ref = m[3] ? `${numToCol(ca)}${ra}:${numToCol(cb)}${rb}` : `${numToCol(ca)}${ra}`;
+    return { r1, c1, r2, c2, total, ref };
+  }
+
+  rangeCells(ws, range) {
+    const { r1, c1, r2, c2 } = this.checkedRange(range);
     const out = [];
     for (let r = Math.min(r1, r2); r <= Math.max(r1, r2); r++) {
       for (let c = Math.min(c1, c2); c <= Math.max(c1, c2); c++) out.push(ws.getCell(r, c));
@@ -82,38 +123,39 @@ export class XlsxDoc {
 
   op_set_cell(op) {
     const ws = this.sheet(op.sheet);
-    const m = /^\$?([A-Z]+)\$?(\d+)$/i.exec(String(op.cell || '').trim());
-    if (!m) throw new Error(`bad cell ref "${op.cell}"`);
-    const cell = ws.getCell(+m[2], colToNum(m[1]));
+    const { row, col } = checkedCell(op.cell);
+    const cell = ws.getCell(row, col);
     if (op.formula !== undefined) cell.value = { formula: String(op.formula).replace(/^=/, '') };
     else if (op.value === undefined) throw new Error('set_cell needs "value" or "formula"');
     else cell.value = op.value;
-    return `set ${ws.name}!${op.cell} = ${op.formula !== undefined ? '=' + op.formula : JSON.stringify(op.value)}`;
+    // echo the normalized ref, not the raw op.cell ($-prefixes, lowercase)
+    const ref = `${numToCol(col)}${row}`;
+    return `set ${ws.name}!${ref} = ${op.formula !== undefined ? '=' + op.formula : JSON.stringify(op.value)}`;
   }
 
   op_insert_rows(op) {
-    const ws = this.sheet(op.sheet); const n = op.count || 1;
-    ws.spliceRows(op.at, 0, ...Array.from({ length: n }, () => []));
-    adjustFormulas(ws, { axis: 'row', at: op.at, count: n, insert: true });
-    return `inserted ${n} row(s) at ${op.at} in ${ws.name} (formulas adjusted)`;
+    const ws = this.sheet(op.sheet); const { at, count: n } = checkedSplice(op, EXCEL_MAX_ROW);
+    ws.spliceRows(at, 0, ...Array.from({ length: n }, () => []));
+    adjustFormulas(ws, { axis: 'row', at, count: n, insert: true });
+    return `inserted ${n} row(s) at ${at} in ${ws.name} (formulas adjusted)`;
   }
   op_delete_rows(op) {
-    const ws = this.sheet(op.sheet); const n = op.count || 1;
-    ws.spliceRows(op.at, n);
-    adjustFormulas(ws, { axis: 'row', at: op.at, count: n, insert: false });
-    return `deleted ${n} row(s) at ${op.at} in ${ws.name} (formulas adjusted)`;
+    const ws = this.sheet(op.sheet); const { at, count: n } = checkedSplice(op, EXCEL_MAX_ROW);
+    ws.spliceRows(at, n);
+    adjustFormulas(ws, { axis: 'row', at, count: n, insert: false });
+    return `deleted ${n} row(s) at ${at} in ${ws.name} (formulas adjusted)`;
   }
   op_insert_cols(op) {
-    const ws = this.sheet(op.sheet); const n = op.count || 1;
-    ws.spliceColumns(op.at, 0, ...Array.from({ length: n }, () => []));
-    adjustFormulas(ws, { axis: 'col', at: op.at, count: n, insert: true });
-    return `inserted ${n} col(s) at ${op.at} in ${ws.name} (formulas adjusted)`;
+    const ws = this.sheet(op.sheet); const { at, count: n } = checkedSplice(op, EXCEL_MAX_COL);
+    ws.spliceColumns(at, 0, ...Array.from({ length: n }, () => []));
+    adjustFormulas(ws, { axis: 'col', at, count: n, insert: true });
+    return `inserted ${n} col(s) at ${at} in ${ws.name} (formulas adjusted)`;
   }
   op_delete_cols(op) {
-    const ws = this.sheet(op.sheet); const n = op.count || 1;
-    ws.spliceColumns(op.at, n);
-    adjustFormulas(ws, { axis: 'col', at: op.at, count: n, insert: false });
-    return `deleted ${n} col(s) at ${op.at} in ${ws.name} (formulas adjusted)`;
+    const ws = this.sheet(op.sheet); const { at, count: n } = checkedSplice(op, EXCEL_MAX_COL);
+    ws.spliceColumns(at, n);
+    adjustFormulas(ws, { axis: 'col', at, count: n, insert: false });
+    return `deleted ${n} col(s) at ${at} in ${ws.name} (formulas adjusted)`;
   }
 
   op_set_format(op) {
@@ -142,19 +184,24 @@ export class XlsxDoc {
   op_delete_sheet(op) { const ws = this.sheet(op.name); this.wb.removeWorksheet(ws.id); return `deleted sheet "${op.name}"`; }
   op_set_col_width(op) { const ws = this.sheet(op.sheet); ws.getColumn(op.col).width = op.width; return `set ${ws.name} col ${op.col} width ${op.width}`; }
   op_set_row_height(op) { const ws = this.sheet(op.sheet); ws.getRow(op.row).height = op.height; return `set ${ws.name} row ${op.row} height ${op.height}`; }
-  op_merge(op) { const ws = this.sheet(op.sheet); ws.mergeCells(op.range); return `merged ${ws.name}!${op.range}`; }
-  op_unmerge(op) { const ws = this.sheet(op.sheet); ws.unmergeCells(op.range); return `unmerged ${ws.name}!${op.range}`; }
+  op_merge(op) { const ws = this.sheet(op.sheet); const range = this.checkedRange(op.range).ref; ws.mergeCells(range); return `merged ${ws.name}!${range}`; }
+  op_unmerge(op) { const ws = this.sheet(op.sheet); const range = this.checkedRange(op.range).ref; ws.unmergeCells(range); return `unmerged ${ws.name}!${range}`; }
   op_freeze(op) {
     const ws = this.sheet(op.sheet);
-    const m = /^\$?([A-Z]+)\$?(\d+)$/i.exec(String(op.cell || '').trim());
-    if (!m) throw new Error(`bad cell ref "${op.cell}"`);
-    const x = colToNum(m[1]) - 1, y = +m[2] - 1;
-    ws.views = [x || y ? { state: 'frozen', xSplit: x, ySplit: y, topLeftCell: op.cell.toUpperCase() } : { state: 'frozen', ySplit: 1 }];
-    return `frozen panes at ${ws.name}!${op.cell}`;
+    const { row, col } = checkedCell(op.cell);
+    const x = col - 1, y = row - 1;
+    // rebuild the ref from validated parts: raw op.cell may be lowercase,
+    // $-prefixed, or not a string at all (toUpperCase would throw)
+    const ref = `${numToCol(col)}${row}`;
+    ws.views = [x || y ? { state: 'frozen', xSplit: x, ySplit: y, topLeftCell: ref } : { state: 'frozen', ySplit: 1 }];
+    return `frozen panes at ${ws.name}!${ref}`;
   }
 
   async save(dest) {
-    await this.wb.xlsx.writeFile(dest || this.path);
+    // atomic write: a failed save must never corrupt the user's workbook.
+    // writeBuffer + shared helper instead of writeFile-to-temp: one
+    // implementation of the atomic-write semantics (mode preservation, fsync).
+    await atomicWriteFile(dest || this.path, await this.wb.xlsx.writeBuffer());
   }
 }
 
@@ -171,13 +218,12 @@ function argb(hex) {
 // --- formula reference adjustment on row/col insert+delete (Excel-style) ---
 const REF = /(?<![A-Za-z0-9_$])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(])/g;
 
-function colToNumS(s) { let n = 0; for (const ch of s.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64); return n; }
 function numToCol(n) { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
 
 function adjustFormulas(ws, { axis, at, count, insert }) {
   const rewrite = (formula) =>
     formula.replace(REF, (m, cDollar, colL, rDollar, rowD) => {
-      const val = axis === 'col' ? colToNumS(colL) : +rowD;
+      const val = axis === 'col' ? colToNum(colL) : +rowD;
       let out;
       if (insert) out = val >= at ? val + count : val;
       else if (val >= at + count) out = val - count;

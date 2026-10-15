@@ -9,6 +9,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { loadProviders } from './providers.js';
 
@@ -102,17 +103,32 @@ export function buildArgv(s = {}) {
     for (const f of [s.file, ...against].filter(Boolean)) a.push(...expandDocs(String(f)));
   }
   const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
-  const num = (v) => (Number.isFinite(+v) && +v > 0 ? String(+v) : null);
+  // zero: fields where 0 is meaningful (0 retries, 0 max steps); otherwise 0 is dropped
+  const num = (v, { zero = false } = {}) =>
+    (v === '' || v == null ? null : (Number.isFinite(+v) && (zero ? +v >= 0 : +v > 0) ? String(+v) : null));
   if (str(s.provider)) a.push('--provider', str(s.provider));
-  if (str(s.url)) a.push('--url', str(s.url));
+  // custom URLs reach the agent verbatim: validate the scheme here too
+  // (/api/run doesn't go through saveCustomProvider's http(s) check)
+  if (str(s.url)) {
+    let u;
+    try { u = new URL(/^[a-z]+:\/\//i.test(s.url) ? s.url : 'https://' + s.url); }
+    catch { throw new Error(`bad custom URL ${JSON.stringify(String(s.url).slice(0, 80))}`); }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:')
+      throw new Error(`custom URL must be http(s), got ${u.protocol}`);
+    a.push('--url', u.href);
+  }
   if (str(s.model)) a.push('--model', str(s.model));
   if (str(s.remoteProvider)) a.push('--remote-provider', str(s.remoteProvider));
   if (['off', 'low', 'normal', 'aggressive'].includes(s.offload)) a.push('--offload', s.offload);
   if (str(s.ask) && mode !== 'calibrate' && mode !== 'doctor') a.push('--ask', str(s.ask));
-  if (num(s.maxRetries)) a.push('--max-retries', num(s.maxRetries));
-  if (num(s.timeout)) a.push('--timeout', num(s.timeout));
-  if (num(s.maxSteps) && mode === 'agent') a.push('--max-steps', num(s.maxSteps));
-  if (num(s.delay)) a.push('--delay', num(s.delay));
+  const maxRetries = num(s.maxRetries, { zero: true });
+  if (maxRetries) a.push('--max-retries', maxRetries);
+  const timeout = num(s.timeout);
+  if (timeout) a.push('--timeout', timeout);
+  const maxSteps = num(s.maxSteps, { zero: true });
+  if (maxSteps && mode === 'agent') a.push('--max-steps', maxSteps);
+  const delay = num(s.delay);
+  if (delay) a.push('--delay', delay);
   if (s.watch && mode !== 'calibrate') a.push('--watch');
   if (s.noBackup && (mode === 'edit' || mode === 'fill')) a.push('--no-backup');
   if (s.yes) a.push('--yes');
@@ -127,6 +143,7 @@ let child = null;
 let logBuf = [];           // replayed to every new SSE client
 let logBytes = 0;
 const sseClients = new Set();
+const MAX_SSE_CLIENTS = 20; // bound FD usage: extra EventSource tabs get 503
 
 function pushLog(type, text) {
   text = stripAnsi(text);
@@ -139,19 +156,33 @@ function pushLog(type, text) {
 
 function stopChild() {
   if (!child) return;
+  // SIGTERM first (lets app.js flush on POSIX; on Windows kill() is
+  // TerminateProcess — immediate, no flush). SIGKILL fallback so a stuck
+  // Chrome driver can't keep the GUI busy forever.
   try { child.kill(); } catch { /* already gone */ }
+  if (process.platform === 'win32') return; // no graceful signal exists to escalate from
+  const victim = child;
+  // exitCode !== null means the child was already reaped — killing then could
+  // hit a recycled PID belonging to an unrelated process
+  const killer = setTimeout(() => {
+    if (victim.exitCode === null) { try { victim.kill('SIGKILL'); } catch { /* exited */ } }
+  }, 5000);
+  killer.unref?.();
 }
 
-function runChild(argv) {
+function runChild(argv, spawnProcess = spawn) {
   if (child) throw new Error('a session is already running — stop it first');
   logBuf = []; logBytes = 0;
   const printable = ['node src/app.js', ...argv.map((x) => (/\s/.test(x) ? `"${x}"` : x))].join(' ');
   pushLog('sys', `$ ${printable}\n`);
-  child = spawn(process.execPath, [APP_JS, ...argv], {
+  child = spawnProcess(process.execPath, [APP_JS, ...argv], {
     cwd: APP_ROOT,
     env: { ...process.env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // a dead child's stdin emits an async 'error' that would otherwise crash the
+  // whole GUI server with an uncaught exception (e.g. /api/input racing exit)
+  child.stdin.on('error', (e) => pushLog('err', `stdin write failed: ${e.message}\n`));
   child.stdout.on('data', (d) => pushLog('out', d.toString('utf8')));
   child.stderr.on('data', (d) => pushLog('err', d.toString('utf8')));
   child.on('error', (e) => pushLog('err', `failed to start: ${e.message}\n`));
@@ -167,29 +198,140 @@ let shutdownTimer = null;
 function scheduleShutdown() {
   if (child || sseClients.size > 0 || shutdownTimer) return;
   shutdownTimer = setTimeout(() => { console.log('[gui] window closed — shutting down'); process.exit(0); }, 5000);
+  // In tests/embedded use the server may already be closed; the timer must not
+  // be the sole handle keeping that process alive. In production the listening
+  // server keeps the loop alive, so the shutdown deadline still fires.
+  shutdownTimer.unref?.();
 }
 function cancelShutdown() {
   if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
 }
 
 // --- HTTP --------------------------------------------------------------------
+// Only loopback clients may drive the GUI: the browser page is served from
+// this same server, so any other Host means DNS-rebinding or a foreign origin
+// probing the port. Reject before touching any endpoint.
+function loopbackOnly(req, res) {
+  const host = String(req.headers.host || '').split(',')[0].trim().toLowerCase();
+  // reject userinfo/scheme/path/whitespace in Host: new URL('http://x@127.0.0.1')
+  // would otherwise report hostname 127.0.0.1 for a malformed header
+  if (/[@/\\?#\s]/.test(host)) {
+    json(res, { error: 'forbidden: bad host header' }, 403);
+    return false;
+  }
+  let name;
+  try { name = new URL(`http://${host}`).hostname.replace(/^\[|\]$/g, ''); }
+  catch { name = ''; }
+  if (name !== '127.0.0.1' && name !== '::1' && name !== 'localhost') {
+    json(res, { error: 'forbidden: loopback only' }, 403);
+    return false;
+  }
+  if (req.method === 'OPTIONS') {
+    json(res, { error: 'forbidden' }, 403);
+    return false;
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const origin = String(req.headers.origin || '');
+    if (origin) {
+      let o = null;
+      try { o = new URL(origin); } catch { /* rejected below */ }
+      if (!o || o.protocol !== 'http:' || o.host.toLowerCase() !== host) {
+        json(res, { error: 'forbidden: bad origin' }, 403);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function tokenMatches(given, expected) {
+  const a = Buffer.from(String(given || ''));
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function requireToken(req, res, u, token) {
+  // Query-string token only for /api/stream: EventSource cannot set headers,
+  // and confining it there keeps the token out of any future per-request
+  // logging of API URLs.
+  const given = req.headers['x-gui-token'] || (u.pathname === '/api/stream' ? u.searchParams.get('token') : null);
+  if (!tokenMatches(given, token)) {
+    json(res, { error: 'forbidden: bad GUI token' }, 403);
+    return false;
+  }
+  return true;
+}
+
+function httpError(status, message) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
+}
+
 async function readBody(req) {
-  let data = '';
-  for await (const chunk of req) data += chunk;
-  try { return JSON.parse(data || '{}'); } catch { return {}; }
+  // collect raw Buffers and decode at the end: chunk.length on a Buffer is
+  // bytes (the cap must be byte-accurate) and Buffer.concat cannot split a
+  // multi-byte UTF-8 sequence the way per-chunk string decoding can
+  const chunks = [];
+  let size = 0, tooLarge = false;
+  for await (const chunk of req) {
+    // keep draining even past the cap so the connection stays reusable
+    if (tooLarge) continue;
+    size += chunk.length;
+    if (size > 1_000_000) { tooLarge = true; chunks.length = 0; continue; }
+    chunks.push(chunk);
+  }
+  if (tooLarge) throw httpError(413, 'request body too large');
+  const data = Buffer.concat(chunks).toString('utf8');
+  try { return JSON.parse(data || '{}'); }
+  catch { throw httpError(400, 'malformed JSON body'); }
 }
 
 function json(res, obj, code = 200) {
-  res.writeHead(code, { 'content-type': 'application/json' });
+  // a route that already wrote headers (e.g. an SSE stream) must not make the
+  // error handler throw ERR_HTTP_HEADERS_SENT and leave an unhandled rejection
+  if (res.headersSent) { try { res.end(); } catch { /* already ended */ } return; }
+  res.writeHead(code, {
+    'content-type': 'application/json',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  });
   res.end(JSON.stringify(obj));
 }
 
-async function handle(req, res) {
+// Read once at startup: the client is served as a static asset (see the
+// /gui-client.js route) so it lives in a real .js file instead of a giant
+// template literal, and needs no escaping.
+const CLIENT_JS = fs.readFileSync(new URL('./gui_client.js', import.meta.url), 'utf8');
+
+function pageForToken(token) {
+  // The token is embedded in the served page: anyone who can READ this origin
+  // is trusted to drive it. The loopback Host check in loopbackOnly() is the
+  // only thing keeping a DNS-rebinding browser tab from receiving the token —
+  // do not weaken that gate.
+  return PAGE.replaceAll('%%GUI_TOKEN%%', token);
+}
+
+async function handle(req, res, token, spawnProcess) {
   const u = new URL(req.url, 'http://localhost');
+  if (!loopbackOnly(req, res)) return;
+  if (u.pathname.startsWith('/api/') && !requireToken(req, res, u, token)) return;
   cancelShutdown();
   if (u.pathname === '/' || u.pathname === '/index.html') {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    return res.end(PAGE);
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    return res.end(pageForToken(token));
+  }
+  if (u.pathname === '/gui-client.js') {
+    res.writeHead(200, {
+      'content-type': 'text/javascript; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    return res.end(CLIENT_JS);
   }
   if (u.pathname === '/api/options') {
     const providers = Object.entries(loadProviders()).map(([name, p]) => ({
@@ -211,6 +353,8 @@ async function handle(req, res) {
   }
   if (u.pathname === '/api/settings' && req.method === 'POST') {
     const body = await readBody(req);
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return json(res, { ok: false, error: 'settings must be a JSON object' }, 400);
     try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(body, null, 2)); } catch { /* best effort */ }
     return json(res, { ok: true });
   }
@@ -246,20 +390,31 @@ async function handle(req, res) {
     const parent = path.dirname(p);
     return json(res, { path: p, parent: parent !== p ? parent : '', dirs, docs });
   }
+  if (u.pathname === '/api/preview' && req.method === 'POST') {
+    // the page renders the exact argv the run will get — one source of truth
+    // (buildArgv) instead of a mirrored copy of the mode gates in the client
+    const body = await readBody(req);
+    try { return json(res, { ok: true, argv: buildArgv(body) }); }
+    catch (e) { return json(res, { ok: false, error: e.message }); }
+  }
   if (u.pathname === '/api/run' && req.method === 'POST') {
     const body = await readBody(req);
+    let argv;
+    try { argv = buildArgv(body); } // single build: no duplicate fs walks, echo === what ran
+    catch (e) { return json(res, { ok: false, error: e.message }, 400); } // bad form state (e.g. URL)
     try {
-      runChild(buildArgv(body));
-      return json(res, { ok: true, argv: buildArgv(body) });
-    } catch (e) { return json(res, { ok: false, error: e.message }, 409); }
+      runChild(argv, spawnProcess);
+      return json(res, { ok: true, argv });
+    } catch (e) { return json(res, { ok: false, error: e.message }, 409); } // session already running
   }
   if (u.pathname === '/api/input' && req.method === 'POST') {
     const body = await readBody(req);
-    if (child && typeof body.line === 'string') {
+    const writable = !!child && child.exitCode === null;
+    if (writable && typeof body.line === 'string') {
       pushLog('in', `> ${body.line}\n`);
-      child.stdin.write(body.line + '\n');
+      try { child.stdin.write(body.line + '\n'); } catch { /* child exited mid-write */ }
     }
-    return json(res, { ok: !!child });
+    return json(res, { ok: writable });
   }
   if (u.pathname === '/api/stop' && req.method === 'POST') {
     stopChild();
@@ -272,6 +427,11 @@ async function handle(req, res) {
     return;
   }
   if (u.pathname === '/api/stream') {
+    if (sseClients.size >= MAX_SSE_CLIENTS) {
+      res.writeHead(503, { 'content-type': 'text/plain' });
+      res.end('too many stream clients');
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     res.write(`data: ${JSON.stringify({ type: 'sys', text: child ? '' : '(no session running yet)\n' })}\n\n`);
     for (const item of logBuf) res.write(`data: ${JSON.stringify(item)}\n\n`);
@@ -282,8 +442,12 @@ async function handle(req, res) {
   json(res, { error: 'not found' }, 404);
 }
 
-export function createGuiServer() {
-  return http.createServer((req, res) => handle(req, res).catch((e) => json(res, { error: e.message }, 500)));
+export function createGuiServer({ spawnProcess = spawn } = {}) {
+  const token = randomBytes(24).toString('base64url');
+  const server = http.createServer((req, res) =>
+    handle(req, res, token, spawnProcess).catch((e) => json(res, { error: e.message }, e.status || 500)));
+  server.guiToken = token;
+  return server;
 }
 
 export async function startGui() {
@@ -299,16 +463,21 @@ const PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>chat-window-agent</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#14161a;--panel:#1d2026;--border:#30343c;--fg:#e6e8eb;--muted:#9aa0a8;--accent:#4f8cff;--ok:#3fb96b;--err:#e05c5c}
+:root{--bg:#14161a;--panel:#1d2026;--border:#30343c;--fg:#e6e8eb;--muted:#9aa0a8;--accent:#4f8cff;--ok:#3fb96b;--err:#e05c5c;--warn:#e0a94f}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif}
-header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px}
+header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 header b{font-size:15px}
 header .sp{flex:1}
-main{display:grid;grid-template-columns:360px 1fr;gap:0;height:calc(100vh - 49px)}
+#phase{font-size:12px;color:var(--accent);background:rgba(79,140,255,.12);border:1px solid rgba(79,140,255,.35);border-radius:999px;padding:3px 10px;max-width:52%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#phase.ok{color:var(--ok);background:rgba(63,185,107,.12);border-color:rgba(63,185,107,.35)}
+#phase.err{color:var(--err);background:rgba(224,92,92,.12);border-color:rgba(224,92,92,.35)}
+#phase.warn{color:var(--warn);background:rgba(224,169,79,.12);border-color:rgba(224,169,79,.35)}
+main{display:grid;grid-template-columns:390px 1fr;gap:0;height:calc(100vh - 49px)}
 form{padding:14px 16px;overflow:auto;border-right:1px solid var(--border)}
 label{display:block;margin:10px 0 3px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 select,input[type=text],input[type=number],textarea{width:100%;background:#0f1114;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:7px 9px;font:inherit}
+select:focus,input:focus,textarea:focus{outline:none;border-color:var(--accent)}
 textarea{min-height:64px;resize:vertical}
 .row{display:flex;gap:8px;align-items:center}
 .checks{display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;margin-top:8px}
@@ -317,14 +486,43 @@ textarea{min-height:64px;resize:vertical}
 button{background:var(--accent);border:0;color:#fff;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}
 button.ghost{background:transparent;border:1px solid var(--border);color:var(--fg)}
 button:disabled{opacity:.45;cursor:default}
-#preview{margin-top:12px;background:#0f1114;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font:12px ui-monospace,Consolas,monospace;color:var(--muted);word-break:break-all;white-space:pre-wrap}
+button.primary{font-weight:600}
+/* --- intro / steps / advanced --- */
+.intro{background:linear-gradient(180deg,#1b2233,#1a1e26);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;margin-bottom:6px}
+.intro p{margin:0;font-size:12.5px;color:var(--fg);line-height:1.5}
+.intro b{color:#fff}
+.intro .how{color:var(--muted);font-size:11.5px;margin-top:4px}
+.step{margin-top:14px}
+.step>.steptitle{display:flex;align-items:center;gap:8px;margin:0 0 6px;color:var(--fg);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+.step>.steptitle .n{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;font-weight:700;flex:none}
+.step .body{border:1px solid var(--border);border-radius:8px;padding:6px 12px 12px;background:var(--panel)}
+details.adv{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:0;margin-top:14px}
+details.adv>summary{cursor:pointer;list-style:none;padding:9px 12px;color:var(--fg);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;user-select:none}
+details.adv>summary::-webkit-details-marker{display:none}
+details.adv>summary::before{content:"▸ ";color:var(--accent)}
+details.adv[open]>summary::before{content:"▾ "}
+details.adv>.advbody{padding:0 12px 12px}
+details.adv label:first-of-type{margin-top:0}
+/* --- command preview + run --- */
+#cmdwrap{margin-top:12px}
+#cmdbar{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+#cmdbar .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;flex:1}
+#preview{margin:0;background:#0f1114;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font:12px ui-monospace,Consolas,monospace;color:var(--muted);word-break:break-all;white-space:pre-wrap}
+#copybtn{padding:3px 9px;font-size:11px}
 #evlist div{display:flex;justify-content:space-between;gap:8px;background:#0f1114;border:1px solid var(--border);border-radius:6px;padding:4px 8px;margin-top:4px;font-size:12px}
 #evlist a{color:var(--err);cursor:pointer;text-decoration:none}
 .right{display:flex;flex-direction:column;min-width:0}
+#outwrap{display:flex;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);color:var(--muted);font-size:12px}
+#outwrap .title{font-weight:700;color:var(--fg);letter-spacing:.03em}
+#outwrap .sp{flex:1}
+#outwrap label{display:inline-flex;align-items:center;gap:5px;margin:0;text-transform:none;letter-spacing:0;color:var(--muted);font-size:12px;cursor:pointer}
+#outwrap input{width:auto}
+#outwrap button{padding:3px 9px;font-size:11px}
 #out{flex:1;overflow:auto;margin:0;padding:12px 16px;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
 #out .err{color:var(--err)} #out .sys{color:var(--muted)} #out .in{color:var(--accent)} #out .exit{color:var(--ok)}
 #inputrow{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}
 #stdin{flex:1}
+#stdin:disabled{opacity:.5}
 .hidden{display:none!important}
 .status{font-size:12px;color:var(--muted)}
 .help{font-size:11px;color:var(--muted);margin:2px 0 6px;line-height:1.35}
@@ -334,27 +532,40 @@ button:disabled{opacity:.45;cursor:default}
 #foldermodal.hidden{display:none}
 #foldermodal .box{background:var(--panel);border:1px solid var(--border);border-radius:8px;width:440px;max-height:70vh;display:flex;flex-direction:column}
 #fmlist{flex:1;overflow:auto;padding:6px}
+@media (max-width:760px){main{grid-template-columns:1fr;height:auto}form{border-right:0;border-bottom:1px solid var(--border)}.right{min-height:50vh}}
 </style></head>
 <body>
-<header><b>chat-window-agent</b><span class="status" id="status">idle</span><span class="sp"></span>
+<header><b>chat-window-agent</b><span class="help" style="margin:0;max-width:34ch">edit Word &amp; Excel with a browser chat AI — no API keys</span>
+<span class="sp"></span><span id="phase" class="hidden" title="what the session is doing right now"></span>
+<span class="status" id="status">idle</span>
 <button class="ghost" id="quitbtn" type="button">Quit</button></header>
 <main>
 <form id="f" onsubmit="return false">
-  <label>Mode</label>
-  <select name="mode">
-    <option value="agent">agent — conversational AI with tools (default)</option>
-    <option value="edit">edit — edit one Word/Excel file</option>
-    <option value="fill">fill — compliance checklist vs evidence docs</option>
-    <option value="ask">ask — one question to a cloud chat, no tools</option>
-    <option value="calibrate">calibrate — teach a custom chat UI</option>
-    <option value="doctor">doctor — diagnose browser selectors</option>
-    <option value="models">models — list downloaded local models</option>
-  </select>
-  <div class="help" id="modehelp"></div>
-  <label>AI chat (provider)</label>
-  <div class="row"><select name="provider" id="provider" style="flex:1"></select>
-  <button class="ghost" type="button" id="addprov" title="Add a company/custom chat window">＋ Custom…</button></div>
-  <div class="help">which AI chat window to drive — log in once in its Chrome window; ＋ Custom… adds your company chat</div>
+  <div class="intro">
+    <p><b>Drive a real AI chat in Chrome</b> to read and edit your documents — no API keys. Pick a <b>mode</b>, pick the <b>AI chat</b>, then <b>Run</b>. The session output appears on the right; type there to steer it.</p>
+    <p class="how">First time? Log into your AI in the Chrome window it opens — the session is remembered.</p>
+  </div>
+  <div class="step">
+    <div class="steptitle"><span class="n">1</span> What should it do?</div>
+    <div class="body">
+    <select name="mode" aria-label="Mode">
+      <option value="agent">agent — conversational AI with tools (default)</option>
+      <option value="edit">edit — edit one Word/Excel file</option>
+      <option value="fill">fill — compliance checklist vs evidence docs</option>
+      <option value="ask">ask — one question to a cloud chat, no tools</option>
+      <option value="calibrate">calibrate — teach a custom chat UI</option>
+      <option value="doctor">doctor — diagnose browser selectors</option>
+      <option value="models">models — list downloaded local models</option>
+    </select>
+    <div class="help" id="modehelp"></div>
+    </div>
+  </div>
+  <div class="step">
+    <div class="steptitle"><span class="n">2</span> Which AI chat?</div>
+    <div class="body">
+    <div class="row"><select name="provider" id="provider" style="flex:1" aria-label="AI chat provider"></select>
+    <button class="ghost" type="button" id="addprov" title="Add a company/custom chat window">＋ Custom…</button></div>
+    <div class="help">which AI chat window to drive — log in once in its Chrome window; ＋ Custom… adds your company chat</div>
   <div id="provform" class="hidden" style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-top:6px">
     <label>Work chat URL</label>
     <input type="text" id="purl" placeholder="https://chat.mycompany.com">
@@ -374,37 +585,6 @@ button:disabled{opacity:.45;cursor:default}
     </div>
     <div class="help">your local model works next to the big chat-window AI — it can hand the local model on-machine work, nothing leaves the computer</div>
   </div>
-  <div id="filewrap">
-    <label>File to edit / attach</label>
-    <div class="row"><input type="text" name="file" list="docs" placeholder="(optional — picker opens if empty)">
-    <button class="ghost" type="button" id="browse">Browse…</button></div>
-    <datalist id="docs"></datalist>
-    <div class="help">the document to work on — Word/Excel for edit/fill, any document for agent; a picker opens if left empty</div>
-    <label>Evidence documents / folder (--against)</label>
-    <div id="evlist"></div>
-    <div class="row"><button class="ghost" type="button" id="addev">Add files…</button>
-    <button class="ghost" type="button" id="addevfolder">Add folder…</button></div>
-    <div class="help">read-only reference material the AI reviews — a folder means every document inside it</div>
-  </div>
-  <label>Instruction (optional — empty = interactive session)</label>
-  <textarea name="ask" placeholder="e.g. fix the totals and flag anomalies" title="What the AI should do. Leave empty for an interactive session you steer from the input box on the right."></textarea>
-  <div class="help">leave empty for an interactive session you steer from the input box on the right</div>
-  <label>Options</label>
-  <div class="checks">
-    <label title="You type requests directly in the browser chat window; the tool watches and applies every AI reply. The input box here is unused."><input type="checkbox" name="watch"> --watch (chat in browser)</label>
-    <label title="Run shell commands and file writes WITHOUT asking you yes/no first. Convenient but riskier."><input type="checkbox" name="yes"> --yes (skip approvals)</label>
-    <label title="Don't save a timestamped backup before editing a document (backups/ folder)."><input type="checkbox" name="noBackup"> --no-backup</label>
-    <label title="Neutral 'planning component' framing for company/preset AIs that refuse the agent role."><input type="checkbox" name="plain"> --plain (neutral framing)</label>
-    <label title="Simplified protocol: one tool per reply, short rules. Helps weaker models follow instructions."><input type="checkbox" name="simple"> --simple (weak models)</label>
-  </div>
-  <div class="row">
-    <div style="flex:1"><label title="Self-correction rounds when the AI's reply is broken or fails to apply (default 3).">--max-retries</label><input type="number" name="maxRetries" min="0" placeholder="3"></div>
-    <div style="flex:1"><label title="Maximum tool steps per request in agent mode (default 40).">--max-steps</label><input type="number" name="maxSteps" min="0" placeholder="(default)"></div>
-  </div>
-  <div class="row">
-    <div style="flex:1"><label title="How long to wait for an AI reply before failing, in milliseconds (default from the provider).">--timeout (ms)</label><input type="number" name="timeout" min="0" placeholder="(provider)"></div>
-    <div style="flex:1"><label title="Wait this many seconds after the chat opens before the first message — time to pick a model or adjust chat settings.">--delay (s)</label><input type="number" name="delay" min="0" placeholder="0"></div>
-  </div>
   <div id="modelwrap" class="hidden">
     <label>Local model (--model)</label>
     <select name="model" id="modelsel"></select>
@@ -418,18 +598,73 @@ button:disabled{opacity:.45;cursor:default}
       <div style="flex:1"><label title="Which cloud chat window the local model consults via the remote.ask tool.">Remote provider</label><select name="remoteProvider" id="remotesel"></select></div>
     </div>
   </div>
-  <label>Chat URL override (optional)</label>
-  <input type="text" name="url" placeholder="https://…">
-  <div class="help">override the chat URL — also selects which already-open tab to drive</div>
-  <div id="preview"></div>
-  <div class="row" style="margin-top:12px">
-    <button id="run" type="button">▶ Run</button>
-    <button class="ghost" id="stop" type="button" disabled>■ Stop</button>
+    </div>
+  </div>
+  <div class="step" id="filewrap">
+    <div class="steptitle"><span class="n">3</span> Files <span class="help" style="margin:0;text-transform:none;letter-spacing:0">(optional)</span></div>
+    <div class="body">
+    <label>File to edit / attach</label>
+    <div class="row"><input type="text" name="file" list="docs" placeholder="(optional — picker opens if empty)">
+    <button class="ghost" type="button" id="browse">Browse…</button></div>
+    <datalist id="docs"></datalist>
+    <div class="help">the document to work on — Word/Excel for edit/fill, any document for agent; a picker opens if left empty</div>
+    <label>Evidence documents / folder (--against)</label>
+    <div id="evlist"></div>
+    <div class="row"><button class="ghost" type="button" id="addev">Add files…</button>
+    <button class="ghost" type="button" id="addevfolder">Add folder…</button></div>
+    <div class="help">read-only reference material the AI reviews — a folder means every document inside it</div>
+    </div>
+  </div>
+  <div class="step">
+    <div class="steptitle"><span class="n">4</span> Instruction <span class="help" style="margin:0;text-transform:none;letter-spacing:0">(optional)</span></div>
+    <div class="body">
+    <textarea name="ask" placeholder="e.g. fix the totals and flag anomalies" title="What the AI should do. Leave empty for an interactive session you steer from the input box on the right."></textarea>
+    <div class="help">leave empty for an interactive session you steer from the input box on the right</div>
+    </div>
+  </div>
+
+  <details class="adv" id="advanced">
+    <summary>Advanced options</summary>
+    <div class="advbody">
+    <div class="checks">
+      <label title="You type requests directly in the browser chat window; the tool watches and applies every AI reply. The input box here is unused."><input type="checkbox" name="watch"> --watch (chat in browser)</label>
+      <label title="Run shell commands and file writes WITHOUT asking you yes/no first. Convenient but riskier."><input type="checkbox" name="yes"> --yes (skip approvals)</label>
+      <label title="Don't save a timestamped backup before editing a document (backups/ folder)."><input type="checkbox" name="noBackup"> --no-backup</label>
+      <label title="Neutral 'planning component' framing for company/preset AIs that refuse the agent role."><input type="checkbox" name="plain"> --plain (neutral framing)</label>
+      <label title="Simplified protocol: one tool per reply, short rules. Helps weaker models follow instructions."><input type="checkbox" name="simple"> --simple (weak models)</label>
+    </div>
+    <div class="row">
+      <div style="flex:1"><label title="Self-correction rounds when the AI's reply is broken or fails to apply (default 3).">--max-retries</label><input type="number" name="maxRetries" min="0" placeholder="3"></div>
+      <div style="flex:1"><label title="Maximum tool steps per request in agent mode (default 40).">--max-steps</label><input type="number" name="maxSteps" min="0" placeholder="(default)"></div>
+    </div>
+    <div class="row">
+      <div style="flex:1"><label title="How long to wait for an AI reply before failing, in milliseconds (default from the provider).">--timeout (ms)</label><input type="number" name="timeout" min="0" placeholder="(provider)"></div>
+      <div style="flex:1"><label title="Wait this many seconds after the chat opens before the first message — time to pick a model or adjust chat settings.">--delay (s)</label><input type="number" name="delay" min="0" placeholder="0"></div>
+    </div>
+    <label>Chat URL override (optional)</label>
+    <input type="text" name="url" placeholder="https://…">
+    <div class="help">override the chat URL — also selects which already-open tab to drive</div>
+    </div>
+  </details>
+
+  <div id="cmdwrap">
+    <div id="cmdbar"><span class="lbl">Command that will run</span><button class="ghost" type="button" id="copybtn" title="Copy the command to the clipboard">Copy</button></div>
+    <div id="preview"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="run" type="button" class="primary" title="Run (Ctrl/Cmd + Enter)">▶ Run</button>
+      <button class="ghost" id="stop" type="button" disabled>■ Stop</button>
+    </div>
   </div>
 </form>
 <div class="right">
+  <div id="outwrap">
+    <span class="title">Session output</span>
+    <span class="sp"></span>
+    <label title="Keep the newest output in view"><input type="checkbox" id="autoscroll" checked> auto-scroll</label>
+    <button class="ghost" type="button" id="clearbtn">Clear</button>
+  </div>
   <pre id="out"></pre>
-  <div id="inputrow"><input id="stdin" type="text" placeholder="type a reply / instruction and press Enter (goes to the session)"><button type="button" id="send">Send</button></div>
+  <div id="inputrow"><input id="stdin" type="text" placeholder="Reply to the session here (answers agent&gt; prompts and [y/N] questions), then press Enter" disabled><button type="button" id="send" disabled>Send</button></div>
 </div>
 </main>
 <div id="foldermodal" class="hidden">
@@ -443,186 +678,11 @@ button:disabled{opacity:.45;cursor:default}
     </div>
   </div>
 </div>
-<script>
-const $ = (s) => document.querySelector(s);
-const f = $('#f');
-let providers = [], running = false;
-
-async function api(p, body) {
-  const r = await fetch(p, body === undefined ? undefined : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  return r.json();
-}
-
-function state() {
-  const d = new FormData(f), s = {};
-  for (const [k, v] of d) s[k] = v;
-  for (const c of f.querySelectorAll('input[type=checkbox]')) s[c.name] = c.checked;
-  s.against = [...document.querySelectorAll('#evlist span')].map((e) => e.dataset.p);
-  return s;
-}
-
-function preview() {
-  const s = state();
-  if (s.mode === 'models') { $('#preview').textContent = 'run.bat models'; return; }
-  const parts = ['run.bat', s.mode];
-  if ((s.mode === 'edit' || s.mode === 'fill') && s.file) parts.push(s.file);
-  if (s.mode === 'agent') for (const x of [s.file, ...s.against].filter(Boolean)) parts.push(x);
-  if ((s.mode === 'edit' || s.mode === 'fill')) for (const x of s.against) parts.push('--against', x);
-  for (const [k, flag] of [['provider','--provider'],['url','--url'],['model','--model'],['remoteProvider','--remote-provider'],['offload','--offload'],['ask','--ask'],['maxRetries','--max-retries'],['timeout','--timeout'],['maxSteps','--max-steps'],['delay','--delay']])
-    if (s[k]) parts.push(flag, s[k]);
-  for (const [k, flag] of [['watch','--watch'],['yes','--yes'],['noBackup','--no-backup'],['plain','--plain'],['simple','--simple'],['withLocal','--with-local']])
-    if (s[k] && (k !== 'withLocal' || s.mode === 'agent')) parts.push(flag);
-  $('#preview').textContent = parts.map((p) => (/\\s/.test(p) ? '"' + p + '"' : p)).join(' ');
-}
-
-let saveT;
-const MODE_HELP = {
-  agent: 'general assistant with tools: reads/edits files, runs commands, browses the web — chat with it in the input box on the right',
-  edit: 'focused editing of one Word/Excel document, one instruction at a time',
-  fill: 'reviews a Word checklist against the evidence documents and marks/fills it in',
-  ask: 'sends one question to a cloud chat window and prints the answer — no tools, no files',
-  calibrate: 'teaches the tool a company chat UI by watching one exchange, then saves it as a provider',
-  doctor: 'checks that the saved selectors still match the chat page (run after a site redesign)',
-  models: 'lists the local GGUF models downloaded in models/',
-};
-function changed() {
-  const p = providers.find((x) => x.name === f.provider.value);
-  $('#modehelp').textContent = MODE_HELP[f.mode.value] || '';
-  const isLocal = !!(p && p.local);
-  $('#localopts').classList.toggle('hidden', !isLocal);
-  $('#sidecar').classList.toggle('hidden', isLocal || f.mode.value !== 'agent');
-  $('#modelwrap').classList.toggle('hidden', !(isLocal || (f.withLocal.checked && !isLocal)));
-  const fileModes = ['agent', 'edit', 'fill'];
-  $('#filewrap').classList.toggle('hidden', !fileModes.includes(f.mode.value));
-  f.noBackup.closest('label').classList.toggle('hidden', !['edit', 'fill'].includes(f.mode.value));
-  preview();
-  clearTimeout(saveT);
-  saveT = setTimeout(() => api('/api/settings', state()), 400);
-}
-
-function setRunning(on) {
-  running = on;
-  $('#run').disabled = on; $('#stop').disabled = !on;
-  $('#status').textContent = on ? 'running…' : 'idle';
-}
-
-const out = $('#out');
-function append(type, text) {
-  if (!text) return;
-  const span = document.createElement('span');
-  span.className = type; span.textContent = text;
-  out.appendChild(span);
-  out.scrollTop = out.scrollHeight;
-}
-
-const es = new EventSource('/api/stream');
-es.onmessage = (ev) => {
-  const m = JSON.parse(ev.data);
-  append(m.type, m.text);
-  if (m.type === 'exit') setRunning(false);
-};
-
-$('#run').onclick = async () => {
-  out.textContent = ''; // clear before starting so the echoed command isn't wiped
-  const r = await api('/api/run', state());
-  if (!r.ok) return append('err', r.error + '\\n');
-  setRunning(true);
-};
-$('#stop').onclick = () => api('/api/stop');
-$('#quitbtn').onclick = async () => { await api('/api/quit'); document.body.innerHTML = '<p style="padding:2em">chat-window-agent has shut down — you can close this window.</p>'; };
-function sendInput() {
-  const el = $('#stdin');
-  if (!el.value) return;
-  api('/api/input', { line: el.value });
-  el.value = '';
-}
-$('#send').onclick = sendInput;
-$('#stdin').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendInput(); });
-function addEv(p) {
-  const div = document.createElement('div');
-  div.innerHTML = '<span></span><a>✕</a>';
-  div.querySelector('span').textContent = p; div.querySelector('span').dataset.p = p;
-  div.querySelector('a').onclick = () => { div.remove(); changed(); };
-  $('#evlist').appendChild(div);
-}
-const DOC_EXTS_ALL = ['docx', 'xlsx', 'xlsm', 'pdf', 'csv', 'txt', 'md'];
-$('#browse').onclick = async () => {
-  const mode = f.mode.value;
-  const exts = mode === 'fill' ? ['docx'] : mode === 'edit' ? ['docx', 'xlsx', 'xlsm'] : DOC_EXTS_ALL;
-  const r = await api('/api/pick', { multi: false, exts });
-  if (r.files && r.files[0]) { f.file.value = r.files[0]; changed(); }
-};
-$('#addev').onclick = async () => {
-  const r = await api('/api/pick', { multi: true, exts: DOC_EXTS_ALL });
-  for (const p of r.files || []) addEv(p);
-  changed();
-};
-// in-page folder browser (no native dialog — works however the GUI was launched)
-let fmPath = '';
-async function fmShow(p) {
-  const r = await api('/api/browse' + (p ? '?path=' + encodeURIComponent(p) : ''));
-  if (r.error) { append('err', r.error + String.fromCharCode(10)); return; }
-  fmPath = r.path;
-  $('#fmpath').textContent = r.path ? r.path + (r.docs ? ' — ' + r.docs + ' document(s) directly inside' : ' — no documents directly inside') : 'This computer — pick a drive';
-  const list = $('#fmlist');
-  list.innerHTML = '';
-  if (!r.dirs.length) list.innerHTML = '<div class="help" style="padding:6px">(no subfolders)</div>';
-  for (const d of r.dirs) {
-    const div = document.createElement('div');
-    div.className = 'fmdir';
-    div.textContent = '📁 ' + d;
-    div.onclick = () => fmShow(r.path ? r.path + '/' + d : d);
-    list.appendChild(div);
-  }
-  $('#fmup').disabled = !r.parent;
-  $('#fmup').onclick = () => fmShow(r.parent || '');
-  $('#fmselect').disabled = !r.path;
-}
-$('#addevfolder').onclick = () => { $('#foldermodal').classList.remove('hidden'); fmShow(''); };
-$('#fmcancel').onclick = () => $('#foldermodal').classList.add('hidden');
-$('#fmselect').onclick = () => {
-  if (fmPath) { addEv(fmPath); changed(); }
-  $('#foldermodal').classList.add('hidden');
-};
-
-function renderProviders(list) {
-  $('#provider').innerHTML = list.map((p) => '<option value="' + p.name + '">' + p.label + (p.local ? ' (offline)' : '') + '</option>').join('');
-}
-$('#addprov').onclick = () => $('#provform').classList.toggle('hidden');
-$('#psave').onclick = async () => {
-  const r = await api('/api/provider/custom', { url: $('#purl').value.trim(), name: $('#pname').value.trim(), plain: $('#pplain').checked, simple: $('#psimple').checked, delay: +$('#pdelay').value || 0 });
-  if (!r.ok) return append('err', 'custom provider: ' + r.error + String.fromCharCode(10));
-  const opts = await api('/api/options');
-  providers = opts.providers;
-  renderProviders(providers);
-  f.provider.value = r.name;
-  $('#provform').classList.add('hidden');
-  append('sys', 'saved provider "' + r.name + '" — select it above; run mode "doctor" on it if the chat UI is unusual\\n');
-  changed();
-};
-
-(async function init() {
-  const [opts, saved] = await Promise.all([api('/api/options'), api('/api/settings')]);
-  providers = opts.providers;
-  renderProviders(providers);
-  $('#remotesel').innerHTML = '<option value="">(default)</option>' + opts.providers.filter((p) => !p.local).map((p) => '<option value="' + p.name + '">' + p.label + '</option>').join('');
-  $('#modelsel').innerHTML = '<option value="">(default)</option>' + opts.models.map((m) => '<option value="models/' + m + '">' + m + '</option>').join('');
-  $('#docs').innerHTML = opts.docs.map((d) => '<option value="' + d.replace(/"/g, '&quot;') + '">').join('');
-  for (const [k, v] of Object.entries(saved)) {
-    const el = f.elements[k];
-    if (!el || k === 'against') continue;
-    if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
-  }
-  // default: local AI runs alongside whenever a model is downloaded (user can untick)
-  if (!('withLocal' in saved) && opts.models.length) f.withLocal.checked = true;
-  for (const p of saved.against || []) addEv(p);
-  f.addEventListener('input', changed);
-  changed();
-})();
-</script>
+<script>window.__GUI_TOKEN__ = "%%GUI_TOKEN%%";</script>
+<script src="/gui-client.js"></script>
 </body></html>`;
 
 // Run directly: node src/gui.js
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  startGui();
+  startGui().catch((e) => { console.error(`[gui] failed to start: ${e.message}`); process.exit(1); });
 }
