@@ -7,7 +7,10 @@
 //   doctor [--provider p]              diagnose browser connection + selectors.
 //
 // Common flags:
-//   --provider chatgpt|claude|gemini|<custom>   (default chatgpt; interactive chooser otherwise)
+//   --provider chatgpt|claude|gemini|local|<custom>   (default chatgpt; interactive chooser otherwise)
+//   --model <ref>      local provider model: hf:owner/repo:QUANT (auto-downloads) or .gguf path
+//   --remote-provider <name>   browser provider the local agent consults via the remote.ask tool
+//   --offload <level>  local model division of labor: off|low|normal|aggressive (default: provider's, usually normal)
 //   --url <url>        override chat URL (tab matching follows this host)
 //   --ask "..."        run one instruction non-interactive, then exit
 //   --watch            you chat in the browser; the tool applies every AI reply
@@ -21,8 +24,10 @@
 // calibrate: node src/app.js calibrate --provider <custom>
 //            watch one exchange in a custom/company chat UI and auto-detect its
 //            selectors (saved to providers.json). For corporate chat windows.
+// models:    node src/app.js models [list|pull <ref>|use <ref>|rm <name>]
+//            manage local GGUF models (models/ dir) for --provider local.
 import path from 'node:path';
-import { buildPreamble, buildAgentPreamble } from './prompts.js';
+import { buildPreamble, buildAgentPreamble, OFFLOAD_LEVELS } from './prompts.js';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { loadProviders } from './providers.js';
@@ -48,6 +53,9 @@ function parseArgs(argv) {
     else if (t === '--timeout') a.timeout = +argv[++i];
     else if (t === '--profile') a.profile = argv[++i];
     else if (t === '--plain') a.plain = true;
+    else if (t === '--model') a.model = argv[++i];
+    else if (t === '--remote-provider') a.remoteProvider = argv[++i];
+    else if (t === '--offload') a.offload = argv[++i];
     else if (t === '--simple') a.simple = true;
     else if (t === '--delay') a.delay = +argv[++i];
     else if (t === '--pause') a.pause = true;
@@ -55,6 +63,25 @@ function parseArgs(argv) {
     else a._.push(t);
   }
   return a;
+}
+
+/** Create the chat backend for a provider: browser-driven (AIChat) or a local
+ *  GGUF model (LocalChat, provider "local"). Both expose the same
+ *  start/waitUntilReady/send/newChat/openInNewTab/stop surface. */
+async function makeChat(provider, args, { promptLine } = {}) {
+  if (!provider.local) {
+    const chat = new AIChat(provider, { urlOverride: args.url, timeoutMs: args.timeout, log: (m) => console.log(`${C.d}${m}${C.x}`) });
+    await chat.start({ profileDir: args.profile || defaultProfile() });
+    return chat;
+  }
+  const { LocalChat, pickModelRef } = await import('./local_chat.js');
+  const modelRef = await pickModelRef(args.model || provider.model, {
+    promptLine: promptLine && process.stdin.isTTY ? promptLine : null,
+    log: (m) => console.log(`${C.d}${m}${C.x}`),
+  });
+  const chat = new LocalChat(provider, { modelRef, timeoutMs: args.timeout, log: (m) => console.log(`${C.d}${m}${C.x}`) });
+  await chat.start();
+  return chat;
 }
 
 
@@ -220,8 +247,11 @@ async function runAgent(args, providers, providerName) {
   }
 
   const provider = providers[providerName];
-  const chat = new AIChat(provider, { urlOverride: args.url, timeoutMs: args.timeout, log: (m) => console.log(`${C.d}${m}${C.x}`) });
-  await chat.start({ profileDir: args.profile || defaultProfile() });
+  if (args.watch && provider.local) throw new Error('--watch drives a browser chat window; the local provider has none. Use the agent> REPL or --ask instead.');
+  const offload = args.offload || provider.offload || 'off';
+  if (!OFFLOAD_LEVELS.includes(offload)) throw new Error(`bad --offload "${offload}" (have: ${OFFLOAD_LEVELS.join('|')})`);
+  const remoteChats = new Map(); // remote.ask sessions: name -> { chat, ownConnection }
+  const chat = await makeChat(provider, args, { promptLine });
   try {
     await chat.waitUntilReady();
     await preSendPause(args, provider);
@@ -231,6 +261,31 @@ async function runAgent(args, providers, providerName) {
       return a.startsWith('y');
     };
     const ctx = { log: (m) => console.log(`${C.d}${m}${C.x}`), confirm, cwd: process.cwd() };
+
+    // remote.ask tool: lets the (usually local) agent consult a big cloud AI in
+    // a browser chat window. Lazily opens one session per provider, reuses it.
+    ctx.askRemote = async (question, name) => {
+      const remoteName = name || args.remoteProvider || (provider.local ? 'chatgpt' : providerName);
+      const prov = providers[remoteName];
+      if (!prov || prov.local) throw new Error(`remote.ask needs a browser chat provider (have: ${Object.keys(providers).filter((n) => !providers[n].local).join(', ')})`);
+      let rc = remoteChats.get(remoteName);
+      if (!rc) {
+        if (remoteName === providerName && !provider.local) {
+          rc = { chat: await chat.openInNewTab(), ownConnection: false }; // sibling tab on the same site
+        } else {
+          const c = new AIChat(prov, { timeoutMs: args.timeout, log: (m) => console.log(`${C.d}[remote ${remoteName}] ${m}${C.x}`) });
+          await c.start({ profileDir: args.profile || defaultProfile() });
+          rc = { chat: c, ownConnection: true };
+        }
+        await rc.chat.waitUntilReady();
+        remoteChats.set(remoteName, rc);
+        console.log(`${C.d}remote.ask: opened a ${prov.label || remoteName} chat${C.x}`);
+        // Prime the remote chat like a person would, once: then every
+        // remote.ask is just a plain conversational message.
+        await sendReliable(rc.chat, "Hi! Quick heads-up: I work with a small local AI that handles tasks on my computer. When it gets stuck, I'll paste its question here — please answer the way you'd answer a colleague: natural, concise, plain text. No JSON, no special formatting, no protocol — just a helpful human-style reply.");
+      }
+      return sendReliable(rc.chat, String(question));
+    };
     const maxSteps = args.maxSteps ?? 40;
     const sessionCtx = { fileSnapshots, pending: [] };
 
@@ -244,11 +299,11 @@ async function runAgent(args, providers, providerName) {
       sessionChars += (r || '').length;
       return r;
     };
-    const compressAt = +(process.env.WH_COMPRESS_AT || 100000);
+    const compressAt = +(process.env.WH_COMPRESS_AT || (provider.local ? 16000 : 100000)); // local models have far smaller context windows
 
     let lastTurnProtocol = false; // did the last turn follow the json protocol at all?
     const preambleText = (note) =>
-      buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple }) + (note ? `\n${note}` : '');
+      buildAgentPreamble({ manifest, fileSnapshots: sessionCtx.fileSnapshots, env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple, offload }) + (note ? `\n${note}` : '');
 
     const runTurn = async (turnMsg, turnChat = chat, turnCtx = ctx, turnMaxSteps = maxSteps) => {
       let msg = turnMsg;
@@ -349,7 +404,7 @@ async function runAgent(args, providers, providerName) {
       try {
         console.log(`${C.b}[sub ${id}]${C.x} ${C.d}new tab — subtask: ${String(task).slice(0, 120)}${C.x}`);
         const subPreamble = buildAgentPreamble({
-          manifest, fileSnapshots: [], env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple,
+          manifest, fileSnapshots: [], env: envBlock, plain: args.plain || provider.plain, simple: args.simple || provider.simple, offload,
           contexts: ['SUB-AGENT ROLE: you were spawned by the parent agent to do ONE subtask in this fresh chat. Complete the SUBTASK below using tools, then reply {"action":"final","summary":...} with everything the parent needs. You cannot spawn further sub-agents.'],
         });
         const summary = await runTurn(`${subPreamble}\nSUBTASK: ${task}`, sub, subCtx, Math.min(maxSteps, 15));
@@ -385,7 +440,9 @@ async function runAgent(args, providers, providerName) {
       console.log(`${C.g}new chat ready.${C.x} ${C.d}AI:${C.x} ${String(ack).slice(0, 160)}`);
     };
 
-    const goalSummary = await runTurn(preambleText((args.ask ? `GOAL: ${args.ask}` : "Awaiting the user's first request; the next message will contain it.") + '\nFirst, acknowledge the protocol with {"action":"final","summary":"ready"}.'));
+    const goalSummary = await runTurn(preambleText(args.ask
+      ? `GOAL: ${args.ask}\nStart on the GOAL immediately with tool steps (acknowledge by acting, not by replying "ready"); end with {"action":"final","summary":...} once the goal is achieved.`
+      : "Awaiting the user's first request; the next message will contain it." + '\nFirst, acknowledge the protocol with {"action":"final","summary":"ready"}.'));
     if (!lastTurnProtocol) {
       console.log(`${C.y}${C.B}WARNING: this chat did not follow the json protocol on the first exchange.${C.x}`);
       console.log(`${C.y}Its system prompt is likely overriding the harness. Things that help:${C.x}`);
@@ -454,11 +511,16 @@ async function runAgent(args, providers, providerName) {
     }
     console.log('bye');
   } finally {
+    for (const rc of remoteChats.values()) {
+      try { await rc.chat.page?.close?.(); } catch { /* tab already gone */ }
+      if (rc.ownConnection) { try { rc.chat.stop(); } catch { /* already disconnected */ } }
+    }
     chat.stop();
   }
 }
 /** Auto-detect selectors of a custom/company chat UI by watching one live exchange. */
 async function runCalibrate(args, provider, providerName) {
+  if (provider.local) throw new Error('calibrate watches a browser chat UI — the local provider has no DOM. Nothing to calibrate.');
   const chat = new AIChat(provider, { urlOverride: args.url, log: (m) => console.log(`${C.d}${m}${C.x}`) });
   await chat.start({ profileDir: args.profile || defaultProfile() });
   try {
@@ -597,6 +659,95 @@ async function configProvider(args) {
   console.log(`${C.d}takes effect on the next run — no restart of this command needed${C.x}`);
 }
 
+/** Manage local GGUF models: `models` list, `models pull <ref>`,
+ *  `models use <ref>` (persist default), `models rm <name>`. */
+async function cmdModels(args) {
+  const { listLocalModels, ensureLocalModel, MODELS_DIR } = await import('./local_chat.js');
+  const sub = args._[0] || 'list';
+  if (sub === 'list') {
+    const local = listLocalModels();
+    if (!local.length) console.log(`no models in ${MODELS_DIR} yet — download one, e.g.:\n  run.bat models pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m   (small test)\n  run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M              (full agent)`);
+    for (const m of local) console.log(`  ${m.name}  (${m.sizeMB} MB)`);
+    console.log(`active model: ${loadProviders().local?.model || process.env.WH_LOCAL_MODEL || '(pick at start, or --model <ref>)'}`);
+    return;
+  }
+  if (sub === 'pull') {
+    const ref = args._[1];
+    if (!ref) throw new Error('usage: models pull <hf:owner/repo:QUANT>');
+    const p = await ensureLocalModel(ref, { log: (m) => console.log(`${C.d}${m}${C.x}`) });
+    console.log(`${C.g}ready: ${p}${C.x}`);
+    return;
+  }
+  if (sub === 'use') {
+    const ref = args._[1];
+    if (!ref) throw new Error('usage: models use <hf:owner/repo:QUANT | path/to/file.gguf>');
+    const file = path.resolve('providers.json');
+    const cfg = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+    cfg.local = { ...(cfg.local || {}), model: fs.existsSync(ref) ? path.resolve(ref) : ref };
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+    console.log(`${C.g}default local model set to "${cfg.local.model}" in ${file}${C.x}`);
+    return;
+  }
+  if (sub === 'rm') {
+    const name = args._[1];
+    const hit = listLocalModels().find((m) => m.name === name || m.file === path.resolve(name || ''));
+    if (!hit) throw new Error(`no local model "${name}" (run "models list")`);
+    fs.unlinkSync(hit.file);
+    console.log(`${C.g}deleted ${hit.name}${C.x}`);
+    return;
+  }
+  if (sub === 'recommend') {
+    const { systemSpecs, recommendModel } = await import('./local_chat.js');
+    const gb = (b) => (b / 1024 ** 3).toFixed(1);
+    console.log(`${C.d}probing hardware (GPU check takes a few seconds)…${C.x}`);
+    const specs = await systemSpecs();
+    const rec = recommendModel(specs);
+    console.log(`cpu:  ${specs.cpuModel} (${specs.cpuCores} cores)`);
+    console.log(`ram:  ${gb(specs.totalRAM)} GB total, ${gb(specs.freeRAM)} GB free`);
+    console.log(specs.gpu
+      ? `gpu:  ${specs.gpu}${specs.vram ? ` — ${gb(specs.vram.total)} GB VRAM total, ${gb(specs.vram.free)} GB free` : ' (VRAM unknown)'}`
+      : 'gpu:  none usable — CPU inference (slow for >3B models)');
+    console.log(`safe budget: ${C.B}${gb(rec.budgetBytes)} GB${C.x} model file size  ${C.d}(${rec.basis}, +15% runtime overhead reserved)${C.x}`);
+    console.log(`recommended: ${C.g}${rec.tier.label}${C.x}${rec.capped ? ` ${C.d}(capped: bigger fits your RAM but runs too slowly on CPU)${C.x}` : ''}${rec.tier.tight ? ` ${C.y}— even this is tight; close other apps or use a remote provider${C.x}` : ''}`);
+    if (rec.tier.pull) console.log(`  run.bat models pull ${rec.tier.pull}`);
+    for (const m of listLocalModels()) {
+      const bytes = m.sizeMB * 1048576;
+      const fit = bytes > rec.budgetBytes ? `${C.r}TOO BIG for this machine${C.x}` : bytes > rec.budgetBytes * 0.8 ? `${C.y}tight — expect slowdowns${C.x}` : `${C.g}fits${C.x}`;
+      console.log(`  ${fit}  ${m.name} (${gb(bytes)} GB)`);
+    }
+    return;
+  }
+  throw new Error(`unknown models subcommand "${sub}" (list|pull|use|rm|recommend)`);
+}
+
+/** One-shot Q&A with a cloud AI chat window: no tools, no protocol — the cloud
+ *  model is a smart colleague, not an agent. Everything sent passes through
+ *  scrub.js so secrets/PII never leave the machine. Question comes from --ask
+ *  or stdin; the reply is printed to stdout. Intended for harnesses (e.g. a
+ *  local agent) that offload hard reasoning to a big model. */
+async function runAsk(args, provider, providerName) {
+  const { scrub, redactionSummary } = await import('./scrub.js');
+  let question = args.ask;
+  if (question == null && !process.stdin.isTTY) {
+    question = fs.readFileSync(0, 'utf8');
+  }
+  if (!question || !String(question).trim()) throw new Error('ask needs a question: --ask "..." or piped stdin');
+  const { text, redactions } = scrub(question, { log: (m) => console.error(`${C.y}${m}${C.x}`) });
+  const summary = redactionSummary(redactions);
+  if (summary) console.error(`${C.y}${summary}${C.x}`);
+
+  const chat = await makeChat(provider, args, {});
+  try {
+    await chat.waitUntilReady();
+    await preSendPause(args, provider);
+    await sendReliable(chat, "Hi! Quick heads-up: I work with a small local AI that handles tasks on my computer. When it gets stuck, I'll paste its question here — please answer the way you'd answer a colleague: natural, concise, plain text. No JSON, no special formatting, no protocol — just a helpful human-style reply. Note: anything that looks like <TOKEN>, <EMAIL>, <USER> etc. was redacted locally for privacy — work around the placeholders.");
+    const reply = await sendReliable(chat, text);
+    process.stdout.write(String(reply).trim() + '\n');
+  } finally {
+    chat.stop?.();
+  }
+}
+
 async function main() {
 
 
@@ -607,6 +758,7 @@ async function main() {
     process.exit(0);
   }
   const cmd = !command || command === 'chat' ? 'agent' : command; // default: conversational agent
+  if (cmd === 'models') return cmdModels(args);
   if (cmd === 'rename') return renameProvider(args);
   if (cmd === 'config') return configProvider(args);
   let providers = loadProviders();
@@ -615,7 +767,7 @@ async function main() {
     const { promptLine } = await import('./picker.js');
     const names = Object.keys(providers);
     console.log(`\n${C.B}Which AI chat window should chat-window-agent drive?${C.x}`);
-    names.forEach((n, i) => console.log(`  ${i + 1}) ${providers[n].label || n}  ${C.d}${providers[n].newChat}${C.x}`));
+    names.forEach((n, i) => console.log(`  ${i + 1}) ${providers[n].label || n}  ${C.d}${providers[n].newChat || providers[n].model || 'pick a GGUF model at start'}${C.x}`));
     console.log(`  ${names.length + 1}) ${C.B}Custom…${C.x} ${C.d}use any AI chat URL (openrouter, poe, copilot, a local UI… )${C.x}`);
     const pick = await promptLine(`choice (1-${names.length + 1})> `);
     if (+pick === names.length + 1) {
@@ -632,6 +784,7 @@ async function main() {
   if (!provider) throw new Error(`unknown provider "${providerName}" (have: ${Object.keys(providers).join(', ')})`);
 
   if (command === 'doctor') {
+    if (provider.local) throw new Error('doctor diagnoses browser chat selectors — the local provider needs none. Test it with: run.bat agent --provider local --ask "hello"');
     await ensureChrome({ startUrl: args.url || provider.newChat, profileDir: args.profile || defaultProfile() });
     const chat = new AIChat(provider, { urlOverride: args.url });
     await chat.start({ profileDir: args.profile || defaultProfile() });
@@ -645,9 +798,13 @@ async function main() {
     return;
   }
 
+  if (cmd === 'ask') {
+    if (provider.local) throw new Error('ask consults a cloud AI chat window — the local provider makes no sense here. Use a browser provider (chatgpt|claude|gemini|<custom>).');
+    return runAsk(args, provider, providerName);
+  }
   if (cmd === 'agent') return runAgent(args, providers, providerName);
   if (cmd === 'calibrate') return runCalibrate(args, provider, providerName);
-  if (cmd !== 'edit' && cmd !== 'fill') throw new Error(`unknown command "${cmd}" (agent|edit|fill|calibrate|doctor)`);
+  if (cmd !== 'edit' && cmd !== 'fill') throw new Error(`unknown command "${cmd}" (ask|agent|edit|fill|calibrate|doctor|models|config|rename)`);
   const { pickFile, pickFiles, expandEvidence, promptLine } = await import('./picker.js');
 
   let file = args._[0];
@@ -686,8 +843,8 @@ async function main() {
   });
 
   console.log(`${C.d}provider ${providerName} | file ${abs} | kind ${kind}${sources.length ? ` | sources: ${sources.map((s) => s.name).join(', ')}` : ''}${C.x}`);
-  const chat = new AIChat(provider, { urlOverride: args.url, timeoutMs: args.timeout, log: (m) => console.log(`${C.d}${m}${C.x}`) });
-  await chat.start({ profileDir: args.profile || defaultProfile() });
+  if (args.watch && provider.local) throw new Error('--watch drives a browser chat window; the local provider has none. Type requests in this terminal instead.');
+  const chat = await makeChat(provider, args, { promptLine });
   const session = new Session({ chat, file: abs, kind, maxRetries: args.maxRetries ?? 3, makeBackup: !args.noBackup });
 
   try {

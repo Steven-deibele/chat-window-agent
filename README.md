@@ -23,6 +23,22 @@ In `fill` mode you're also asked to select the evidence documents (multi-select;
 type `all` in the list to review everything found). `--against <folder>` adds every
 supported document in a directory.
 
+**Asking a big AI one question** (no tools, no protocol — the cloud model is a
+colleague, not an agent; built for harnesses that offload hard reasoning):
+
+```
+echo "self-contained question" | node src/app.js ask --provider chatgpt
+node src/app.js ask --provider claude --ask "shorter question"
+```
+
+Everything sent passes through a local scrubber (`src/scrub.js`): API keys,
+tokens, JWTs, private keys, emails, IPs and user paths are replaced with
+placeholders before anything leaves the machine (a `scrubbed: …` report goes to
+stderr; placeholders are explained to the AI in the priming message). Add your
+own company names/terms to `scrub-rules.json` (cwd or app root):
+`[{"pattern": "AcmeCorp", "replacement": "<COMPANY>"}, {"regex": "PROJ-\\d+"}]`.
+The reply is printed on stdout, so calling programs can capture it directly.
+
 - Chrome is launched once with a dedicated debugging profile (`.chrome-profile/`); **log into your AI chat in that window once** and the session persists.
 - The first message of the chat is seeded with a snapshot of your file (paragraph indices, table grids, sheet/cell coordinates) plus the exact ops contract. The AI must reference only those coordinates.
 - Every AI reply is parsed for one ```json block; invalid or failing ops trigger an automatic `TOOL FEEDBACK` message so the AI corrects itself (up to `--max-retries`).
@@ -134,6 +150,50 @@ restart — prefer `tools/`.
 
 Dangerous actions (`shell.run`, `fs.write`, `fs.download`, non-GET `http.request`)
 ask for terminal approval unless `--yes`.
+
+## Local models (GGUF, offline, no browser)
+
+The `local` provider runs a GGUF model **on this machine** via
+[node-llama-cpp](https://github.com/withcatai/node-llama-cpp) (llama.cpp) — no
+browser, no login, works offline. GPU is used automatically when available.
+
+```
+run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # download once (into models/)
+run.bat models use  hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # make it the default
+run.bat agent --provider local                          # REPL driven by the local model
+run.bat agent --provider local --model hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m --ask "list the files here"
+```
+
+Model references: `hf:owner/repo:QUANT` (auto-downloads on first use),
+`hf:owner/repo/file.gguf`, or a path to an existing `.gguf`. `run.bat models`
+lists what's downloaded; `models rm <name>` deletes. Gated Hugging Face repos
+need `HF_TOKEN` set. The local provider defaults to the **simple protocol**
+(one tool call per reply), which small models follow much more reliably.
+
+Not sure what size your machine can handle? `run.bat models recommend` probes
+CPU/RAM/GPU (incl. VRAM), computes a safe model budget that leaves the system
+responsive, suggests the matching size class with its pull command, and flags
+downloaded models that are too big or tight for this machine.
+
+**Asking the big AI for help** — the local agent can call the `remote.ask`
+tool: it opens (once) a browser chat with ChatGPT/Claude/Gemini
+(`--remote-provider claude` to choose) and pastes a self-contained question,
+returning the reply as a tool result. Local model does the file/tool work,
+cloud model handles the hard reasoning. The browser session is only opened on
+first use; `--watch`/`calibrate`/`doctor` don't apply to the local provider.
+
+**Offloading hard thinking** — `--offload <level>` (or `"offload"` on the
+local provider in providers.json) controls how eagerly the local model sends
+hard thinking to the big AI: `off` (never), `low` (only when genuinely stuck),
+`normal` (default — analysis, planning, long writing, judgement calls go to
+`remote.ask`; mechanical steps stay local), `aggressive` (the local model is
+only the hands; it asks first for anything non-trivial and follows the answer
+step by step). If it offloads too little or too much for your taste, just
+change the level — the policy is spelled out in the preamble it reads.
+
+Limits: local models have small context windows — sessions auto-compress at
+~16k chars (`WH_COMPRESS_AT` to change); keep tasks focused. Sub-agents
+(`agent.spawn`) share the loaded model in separate sessions.
 
 ## Company / custom AI chat windows
 
