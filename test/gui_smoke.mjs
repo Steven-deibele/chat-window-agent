@@ -8,11 +8,17 @@ import { createGuiServer, buildArgv } from '../src/gui.js';
 // --- buildArgv unit checks ---
 assert.deepEqual(buildArgv({ mode: 'edit', file: 'a.docx', against: ['b.pdf'], provider: 'claude', ask: 'fix it', noBackup: true, maxRetries: '5' }),
   ['edit', 'a.docx', '--against', 'b.pdf', '--provider', 'claude', '--ask', 'fix it', '--max-retries', '5', '--no-backup']);
+// agent mode: the sidecar checkbox is explicit both ways — unticked opts out
+// with --no-local (CLI default: load whenever a model is ready), ticked pins
+// --with-local (missing model is fatal)
 assert.deepEqual(buildArgv({ mode: 'agent', file: 'x.xlsx', against: ['y.pdf'], yes: true, offload: 'bogus' }),
-  ['agent', 'x.xlsx', 'y.pdf', '--yes']);
+  ['agent', 'x.xlsx', 'y.pdf', '--yes', '--no-local']);
+assert.deepEqual(buildArgv({ mode: 'agent', provider: 'chatgpt', withLocal: true, model: 'models/m.gguf' }),
+  ['agent', '--provider', 'chatgpt', '--model', 'models/m.gguf', '--with-local']);
+assert(!buildArgv({ mode: 'edit', withLocal: true }).includes('--with-local'), 'withLocal only for agent');
 assert.deepEqual(buildArgv({ mode: 'models', provider: 'chatgpt' }), ['models']);
 assert.deepEqual(buildArgv({ mode: 'nonsense' })[0], 'agent');
-assert.deepEqual(buildArgv({ mode: 'agent', url: 'chat.example.com' }).slice(-2), ['--url', 'https://chat.example.com/'], 'scheme-less URL overrides are normalized');
+assert(buildArgv({ mode: 'agent', url: 'chat.example.com' }).includes('https://chat.example.com/'), 'scheme-less URL overrides are normalized');
 console.log('buildArgv: ok');
 
 // --- fake child process: deterministic busy/exit behavior, no browser ---
@@ -64,10 +70,6 @@ let sseRes = null;
 let sseDone = Promise.resolve();
 
 try {
-  assert.deepEqual(buildArgv({ mode: 'agent', provider: 'chatgpt', withLocal: true, model: 'models/m.gguf' }),
-    ['agent', '--provider', 'chatgpt', '--model', 'models/m.gguf', '--with-local']);
-  assert(!buildArgv({ mode: 'edit', withLocal: true }).includes('--with-local'), 'withLocal only for agent');
-
   const page = await (await fetch(base + '/')).text();
   assert(page.includes('chat-window-agent') && page.includes('--watch'), 'page served');
   assert(page.includes('window.__GUI_TOKEN__ = "') && !page.includes('%%GUI_TOKEN%%'), 'server token was injected');

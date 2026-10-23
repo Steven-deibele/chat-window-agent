@@ -134,7 +134,10 @@ export function buildArgv(s = {}) {
   if (s.yes) a.push('--yes');
   if (s.plain) a.push('--plain');
   if (s.simple) a.push('--simple');
-  if (s.withLocal && mode === 'agent') a.push('--with-local');
+  // agent mode: the local sidecar checkbox is the explicit choice both ways —
+  // checked pins --with-local (fail loudly if no model), unticked opts out
+  // with --no-local (the CLI default is: load whenever a model is ready)
+  if (mode === 'agent') a.push(s.withLocal ? '--with-local' : '--no-local');
   return a;
 }
 
@@ -581,9 +584,9 @@ details.adv label:first-of-type{margin-top:0}
   </div>
   <div id="sidecar" class="hidden">
     <div class="checks" style="margin-top:6px">
-      <label style="grid-column:1/-1" title="Loads a downloaded GGUF model on this machine next to the browser session. The chat-window AI gets a local.ask tool to hand it on-machine work (summaries, extraction, drafting) — nothing leaves the computer."><input type="checkbox" name="withLocal"> local AI runs alongside (local.ask)</label>
+      <label style="grid-column:1/-1" title="Loads a downloaded GGUF model on this machine next to the browser session (the CLI does this by default whenever a model is downloaded). The chat-window AI gets a local.ask tool to hand it on-machine work (summaries, extraction, drafting) — nothing leaves the computer. Untick to start without it (--no-local)."><input type="checkbox" name="withLocal"> local AI runs alongside (local.ask)</label>
     </div>
-    <div class="help">your local model works next to the big chat-window AI — it can hand the local model on-machine work, nothing leaves the computer</div>
+    <div class="help">your local model works next to the big chat-window AI — untick to skip it; nothing leaves the computer</div>
   </div>
   <div id="modelwrap" class="hidden">
     <label>Local model (--model)</label>

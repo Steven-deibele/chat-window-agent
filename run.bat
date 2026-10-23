@@ -6,7 +6,7 @@ rem (user-level, no installer, no admin - just PowerShell, present on all Window
 setlocal
 cd /d "%~dp0"
 
-set "NODEVER=v24.21.0"
+set "NODEVER=v24.22.1"
 set "NODE="
 if exist "node-portable\node.exe" (
   set "NODE=node-portable\node.exe"

@@ -186,22 +186,31 @@ const scenarios = [
   {
     name: 'agent (tool loop: docs, tools.create, http, download)',
     reset: true,
-    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agent`, '--ask', 'run the budget demo', '--yes'],
+    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agent`, '--ask', 'run the budget demo', '--yes', '--no-local'],
     verify: 'agent',
   },
   {
     name: 'agentbatch (multi-tool roundtrip)',
-    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentbatch`, '--ask', 'list and report', '--yes'],
+    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentbatch`, '--ask', 'list and report', '--yes', '--no-local'],
     expectOut: ['batched fs.list + sys.info'],
   },
   {
     name: 'agentsub (parallel sub-agents in new tabs)',
-    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentsub`, '--ask', 'delegate the work', '--yes'],
+    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentsub`, '--ask', 'delegate the work', '--yes', '--no-local'],
     expectOut: ['spawned 2 sub-agents'],
   },
   {
+    name: 'withlocal-missing (default sidecar skips silently, explicit flag fails)',
+    // --with-local + a model ref that is NOT on disk: resolveSilentModelRef
+    // must refuse (no download), and the explicit flag turns that into a
+    // startup error before any chat is driven
+    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/`, '--with-local', '--model', 'hf:e2e/not-a-real-repo/missing.gguf'],
+    expectOut: ['--with-local: no local model ready'],
+    expectExit: 1,
+  },
+  {
     name: 'agentcompress (auto-compress + handoff)',
-    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentcompress`],
+    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentcompress`, '--no-local'],
     env: { WH_COMPRESS_AT: '200' },
     interactive: async (h) => {
       if (!(await h.waitFor('agent ready'))) return false;
@@ -213,7 +222,7 @@ const scenarios = [
   },
   {
     name: 'agentwatch (agent steered from the browser)',
-    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentwatch`, '--watch', '--yes'],
+    args: (b) => ['agent', '--provider', 'mock', '--url', `${b}/?scenario=agentwatch`, '--watch', '--yes', '--no-local'],
     waitMarker: 'listed test-files for the user',
   },
   {
@@ -319,7 +328,8 @@ try {
         await h.waitExit(10000);
       } else if (ok) {
         const code = await h.waitExit();
-        if (code !== 0) { ok = false; detail = `exit code ${code}`; }
+        // expectExit: scenarios that assert a deliberate startup failure
+        if (code !== (sc.expectExit ?? 0)) { ok = false; detail = `exit code ${code}`; }
       } else {
         // failed before/inside interactive: kill the child — a live one holds
         // the shared debug port + profile and cascade-fails later scenarios

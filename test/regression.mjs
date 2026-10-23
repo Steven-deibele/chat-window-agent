@@ -1,6 +1,7 @@
 // Regression checks for bugs found during code review. Run: node test/regression.mjs
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import { bounded, atomicWriteFile } from '../src/util.js';
 import { registry } from '../src/tools/registry.js';
 import { DocxDoc } from '../src/docx_doc.js';
@@ -250,6 +251,42 @@ for (const useRegex of [false, true]) {
   const snap = d.snapshot();
   assert(snap.includes('alpha swapped here'), 'first paragraph was replaced');
   assert(snap.includes('beta repeated-token here'), 'second paragraph keeps the original text');
+}
+
+// resolveSilentModelRef (default-on local sidecar): never prompts, never
+// downloads — a missing ref falls back to the single downloaded model, and
+// returns null (skip the sidecar) when nothing resolves offline. MODELS_DIR
+// binds to the cwd at import time, so the checks run in a temp cwd.
+{
+  fs.mkdirSync('.wh-work', { recursive: true });
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join('.wh-work', 'resolver-')));
+  const prevCwd = process.cwd();
+  process.chdir(tmp); // MODELS_DIR binds to the cwd at import time
+  const { resolveSilentModelRef, normalizeModelRef } = await import('../src/local_chat.js');
+  try {
+    fs.mkdirSync('models', { recursive: true });
+    // no ref, no downloads -> null (sidecar silently skipped)
+    assert.equal(await resolveSilentModelRef(null), null, 'no model configured and none downloaded -> null');
+    // configured ref not on disk and not downloadable -> null, no exception
+    assert.equal(await resolveSilentModelRef('hf:e2e/not-a-real-repo/missing.gguf'), null,
+      'missing hf: ref must not download or throw');
+    // exactly one downloaded model -> it is the fallback
+    fs.writeFileSync('models/single.gguf', 'x');
+    assert.equal(await resolveSilentModelRef(null), path.join(tmp, 'models', 'single.gguf'),
+      'single downloaded model is the silent default');
+    // several downloaded, none configured -> null (ambiguous; needs models use)
+    fs.writeFileSync('models/second.gguf', 'x');
+    assert.equal(await resolveSilentModelRef(null), null, 'several models without a default -> null');
+    // explicit ref that exists on disk wins regardless
+    fs.writeFileSync('models/pinned.gguf', 'x');
+    assert.equal(await resolveSilentModelRef('models/pinned.gguf'), path.join(tmp, 'models', 'pinned.gguf'),
+      'existing file ref resolves directly');
+    // normalizeModelRef keeps hf: refs verbatim for the offline resolver
+    assert.equal(normalizeModelRef('hf:owner/repo:Q4'), 'hf:owner/repo:Q4', 'hf: refs are not rewritten');
+  } finally {
+    process.chdir(prevCwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 console.log('regression checks: ok');

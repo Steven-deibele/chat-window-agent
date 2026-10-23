@@ -75,9 +75,10 @@ proxy) to a network.
 **＋ Custom…** next to the provider dropdown adds a company/work chat window
 (URL + name + behavior options) — saved to `providers.json`, same as the
 terminal chooser. In agent mode, a **"local AI runs alongside"** checkbox
-(`--with-local`) loads your downloaded GGUF model next to the chat-window AI
-so the two can work together (the chat AI gets a `local.ask` tool); on by
-default when a model is downloaded.
+controls the GGUF model that runs next to the chat-window AI so the two can
+work together (the chat AI gets a `local.ask` tool). It is ticked by default
+once a model is downloaded — matching the CLI, which always loads it in agent
+mode; untick for `--no-local`.
 
 
 ```
@@ -145,7 +146,7 @@ Flags:
 | `--pause` | same, but waits for you to press Enter instead of a fixed time |
 | `--plain` | neutral "planning component" framing for preset/corporate AIs that refuse the agent role (or `"plain": true` in providers.json) |
 | `--simple` | simplified protocol for weaker models: one tool per reply, short rules, a worked example (or `"simple": true` in providers.json) |
-| `--with-local` | load the on-machine GGUF model *alongside* a browser chat session; the chat-window AI gains a `local.ask` tool to hand it on-machine work (summarize/extract/rewrite pasted text — nothing leaves the computer). `--model` picks which model |
+| `--with-local` / `--no-local` | the on-machine GGUF model runs *alongside* a browser chat session **by default** in agent mode (whenever one is downloaded or configured): the chat-window AI gains a `local.ask` tool to hand it on-machine work (summarize/extract/rewrite pasted text — nothing leaves the computer). `--no-local` starts without it; `--with-local` makes a missing model an error instead of silently starting without it. `--model` picks which model |
 
 Startup UX:
 
@@ -179,6 +180,15 @@ the chat window; the harness detects them (needs "user" selectors on the
 provider — set for chatgpt/claude/gemini/mock/qwen; add yours in providers.json),
 runs the tool calls, posts TOOL_RESULTs back into the chat, and prints the final
 summary in the terminal. Ctrl+C to stop.
+
+**Local AI alongside** — in agent mode a downloaded GGUF model is loaded next
+to the chat-window AI automatically (no flag needed; it starts while the
+browser chat is still connecting). The chat AI can then hand it on-machine work
+through the `local.ask` tool — summarize/extract/rewrite pasted text with
+nothing leaving the computer. `--no-local` starts without it; `--with-local`
+is the strict form that errors when no model is ready. The model is picked
+from `--model` / `providers.json`; if several are downloaded but none is set
+as default, run `run.bat models use <ref>` first.
 
 Built-in tools: `docs.snapshot` / `docs.apply_ops` / `docs.ops_spec` (Word/Excel),
 `fs.read` / `fs.list` / `fs.find` / `fs.search` / `fs.write` / `fs.download`,
@@ -259,11 +269,12 @@ first use; `--watch`/`calibrate`/`doctor` don't apply to the local provider.
 **Offloading hard thinking** — `--offload <level>` (or `"offload"` on the
 local provider in providers.json) controls how eagerly the local model sends
 hard thinking to the big AI: `off` (never), `low` (only when genuinely stuck),
-`normal` (default — analysis, planning, long writing, judgement calls go to
-`remote.ask`; mechanical steps stay local), `aggressive` (the local model is
-only the hands; it asks first for anything non-trivial and follows the answer
-step by step). If it offloads too little or too much for your taste, just
-change the level — the policy is spelled out in the preamble it reads.
+`normal` (**default for the local provider** — analysis, planning, long
+writing, judgement calls go to `remote.ask`; mechanical steps stay local),
+`aggressive` (the local model is only the hands; it asks first for anything
+non-trivial and follows the answer step by step). If it offloads too little or
+too much for your taste, just change the level — the policy is spelled out in
+the preamble it reads.
 
 Limits: local models have small context windows — sessions auto-compress at
 ~16k chars (`WH_COMPRESS_AT` to change); keep tasks focused. Sub-agents
@@ -345,6 +356,11 @@ services, no registry writes, no admin.
    inside this folder.
 3. Run `run.bat` — it bootstraps dependencies and starts the app, using the
    portable Node when present. Corporate proxy? set `HTTPS_PROXY` before step 3.
+
+Use an **LTS Node** (v22 / v24) or v26+: several current packages declare
+engines against LTS lines, so odd-numbered interim releases (v25) trigger
+`EBADENGINE` warnings on every install even though everything works. npm 11.x
+ships with all of them; npm 12 needs v22.22+/v24.15+/v26+.
 
 ## Ops the AI can emit
 

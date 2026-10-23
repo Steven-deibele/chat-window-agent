@@ -75,13 +75,13 @@ export function recommendModel(specs) {
   return { budgetBytes, basis, cpuBound, capped, tier };
 }
 /** .gguf files already downloaded, with sizes. */
-export function listLocalModels() {
-  if (!fs.existsSync(MODELS_DIR)) return [];
-  return fs.readdirSync(MODELS_DIR)
+export function listLocalModels(dir = MODELS_DIR) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
     .filter((f) => f.toLowerCase().endsWith('.gguf'))
     .map((f) => {
-      const st = fs.statSync(path.join(MODELS_DIR, f));
-      return { file: path.join(MODELS_DIR, f), name: f, sizeMB: Math.round(st.size / 1048576) };
+      const st = fs.statSync(path.join(dir, f));
+      return { file: path.join(dir, f), name: f, sizeMB: Math.round(st.size / 1048576) };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -128,6 +128,28 @@ export async function pickModelRef(pre, { promptLine, log = () => {} } = {}) {
   const ref = (await promptLine('model ref (hf:owner/repo:QUANT or .gguf path)> ')).trim();
   if (!ref) throw new Error('no model selected');
   return ref;
+}
+
+/** Non-interactive model resolution for the default-on local sidecar
+ *  (agent mode): never prompts, never downloads — resolves the flag /
+ *  providers.json reference if the file is already on disk, otherwise falls
+ *  back to the single downloaded model. Returns null when nothing can run
+ *  offline, so the caller can skip the sidecar instead of failing startup. */
+export async function resolveSilentModelRef(pre, { log = () => {} } = {}) {
+  const norm = normalizeModelRef(pre);
+  if (norm) {
+    if (fs.existsSync(norm)) return norm;
+    try {
+      const { resolveModelFile } = await import('node-llama-cpp');
+      return await resolveModelFile(norm, { directory: MODELS_DIR, download: false, cli: false });
+    } catch (e) {
+      log(`local sidecar: "${pre}" is not downloaded (${String(e.message).split('\n')[0]})`);
+    }
+  }
+  const local = listLocalModels();
+  if (local.length === 1) return local[0].file;
+  if (local.length > 1) log(`local sidecar: ${local.length} models downloaded and none configured as default — run "run.bat models use <ref>" to pick one`);
+  return null;
 }
 
 /** In-process chat backed by a GGUF model. Duck-types AIChat for the harness. */

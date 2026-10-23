@@ -10,7 +10,7 @@
 //   --provider chatgpt|claude|gemini|local|<custom>   (default chatgpt; interactive chooser otherwise)
 //   --model <ref>      local provider model: hf:owner/repo:QUANT (auto-downloads) or .gguf path
 //   --remote-provider <name>   browser provider the local agent consults via the remote.ask tool
-//   --offload <level>  local model division of labor: off|low|normal|aggressive (default: provider's, usually normal)
+//   --offload <level>  local provider division of labor: off|low|normal|aggressive (local defaults to normal — hard thinking goes to the chat-window AI)
 //   --url <url>        override chat URL (tab matching follows this host)
 //   --ask "..."        run one instruction non-interactive, then exit
 //   --watch            you chat in the browser; the tool applies every AI reply
@@ -57,6 +57,7 @@ function parseArgs(argv) {
     else if (t === '--remote-provider') a.remoteProvider = argv[++i];
     else if (t === '--offload') a.offload = argv[++i];
     else if (t === '--simple') a.simple = true;
+    else if (t === '--no-local') a.noLocal = true;
     else if (t === '--with-local') a.withLocal = true;
     else if (t === '--delay') a.delay = +argv[++i];
     else if (t === '--pause') a.pause = true;
@@ -249,10 +250,10 @@ async function runAgent(args, providers, providerName) {
 
   const provider = providers[providerName];
   if (args.watch && provider.local) throw new Error('--watch drives a browser chat window; the local provider has none. Use the agent> REPL or --ask instead.');
-  const offload = args.offload || provider.offload || 'off';
+  const offload = args.offload || provider.offload || 'off'; // local provider defaults to "normal" in providers.js: hard tasks go to the chat-window AI
   if (!OFFLOAD_LEVELS.includes(offload)) throw new Error(`bad --offload "${offload}" (have: ${OFFLOAD_LEVELS.join('|')})`);
   const remoteChats = new Map(); // remote.ask sessions: name -> { chat, ownConnection }
-  let localSidecar = null; // --with-local: GGUF model running alongside the browser chat
+  let localSidecar = null; // default-on in agent mode: GGUF model alongside the browser chat
   const chat = await makeChat(provider, args, { promptLine });
   try {
     await chat.waitUntilReady();
@@ -289,19 +290,50 @@ async function runAgent(args, providers, providerName) {
       return sendReliable(rc.chat, String(question));
     };
 
-    // local.ask tool: with --with-local, a GGUF model runs on this machine
-    // alongside the browser chat so the big AI can hand it on-machine work
-    // (summaries, extraction, drafting) — nothing leaves the computer.
-    if (args.withLocal && !provider.local) {
-      const { LocalChat, pickModelRef } = await import('./local_chat.js');
-      const modelRef = await pickModelRef(args.model || providers.local?.model, {
-        promptLine: process.stdin.isTTY ? promptLine : null,
+    // local.ask tool: in agent mode a GGUF model runs on this machine
+    // alongside the browser chat by DEFAULT (once one is downloaded), so the
+    // big AI can hand it on-machine work (summaries, extraction, drafting) —
+    // nothing leaves the computer. --no-local skips it; --with-local makes a
+    // missing model fatal instead of quietly starting without it.
+    if (!provider.local && !args.noLocal) {
+      const { LocalChat, resolveSilentModelRef } = await import('./local_chat.js');
+      const sidecarRef = await resolveSilentModelRef(args.model || providers.local?.model, {
         log: (m) => console.log(`${C.d}${m}${C.x}`),
       });
-      localSidecar = new LocalChat(providers.local || { label: 'local' }, { modelRef, timeoutMs: args.timeout, log: (m) => console.log(`${C.d}[local] ${m}${C.x}`) });
-      await localSidecar.start();
-      ctx.askLocal = async (question) => localSidecar.send(String(question));
-      console.log(`${C.d}local.ask: local model ready (${modelRef}) — the chat-window AI can consult it${C.x}`);
+      if (!sidecarRef && args.withLocal) {
+        throw new Error('--with-local: no local model ready — download one first: run.bat models pull <hf:owner/repo:QUANT>, or run with --no-local');
+      }
+      if (sidecarRef) {
+        localSidecar = new LocalChat(providers.local || { label: 'local' }, { modelRef: sidecarRef, timeoutMs: args.timeout, log: (m) => console.log(`${C.d}[local] ${m}${C.x}`) });
+        // Model load takes seconds-to-tens-of-seconds: start it while the
+        // browser chat is still connecting so neither waits for the other.
+        // askLocal chains on sidecarReady, so an early local.ask call waits
+        // for the load instead of hitting a half-initialized session.
+        let sidecarBusy = localSidecar.start().catch((e) => {
+          console.log(`${C.y}local.ask disabled: model failed to load (${e.message})${C.x}`);
+          localSidecar = null;
+          throw e;
+        });
+        ctx.askLocal = async (question) => {
+          if (!localSidecar) throw new Error('local model failed to load — start with --no-local or fix the model');
+          const run = sidecarBusy.then(async () => {
+            try {
+              return await localSidecar.send(String(question));
+            } catch (e) {
+              if (/context overflow/i.test(e.message)) {
+                // long local.ask conversations overflow the sidecar's small
+                // context window — reset its chat and retry the question once
+                await localSidecar.newChat();
+                return localSidecar.send(String(question));
+              }
+              throw e;
+            }
+          });
+          sidecarBusy = run.catch(() => {});
+          return run;
+        };
+        console.log(`${C.d}local.ask: local model loading (${path.basename(String(sidecarRef))}) — the chat-window AI can consult it${C.x}`);
+      }
     }
     const maxSteps = args.maxSteps ?? 40;
     const sessionCtx = { fileSnapshots, pending: [] };

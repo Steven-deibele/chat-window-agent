@@ -835,11 +835,11 @@ const BUILTINS = [
   {
     meta: {
       name: 'local.ask',
-      description: 'Ask the LOCAL AI model running on this computer (loaded alongside this chat via --with-local) to do on-machine work: summarize/rewrite long text, extract data from a pasted excerpt, draft or proofread content — without anything leaving the machine. Paste the FULL text/context into the question; it has no tools and sees only your message.',
+      description: 'Ask the LOCAL AI model running on this computer (loaded alongside this chat — on by default when a model is downloaded; --no-local disables) to do on-machine work: summarize/rewrite long text, extract data from a pasted excerpt, draft or proofread content — without anything leaving the machine. Paste the FULL text/context into the question; it has no tools and sees only your message.',
       params: { question: 'the complete instruction plus the text/data to work on, pasted in full' },
     },
     async run(args, ctx) {
-      if (!ctx.askLocal) throw new Error('local.ask needs a local model running alongside this session (start with --with-local)');
+      if (!ctx.askLocal) throw new Error('local.ask needs a local model loaded alongside this session (start without --no-local, and download one with: run.bat models pull <hf:owner/repo:QUANT>)');
       if (!args?.question) throw new Error('need "question"');
       const reply = await ctx.askLocal(String(args.question));
       return clip(`THE LOCAL AI REPLIED:\n${reply}`, 6000);
