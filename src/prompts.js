@@ -47,13 +47,33 @@ ${sources.map((s) => `\n===== SOURCE: ${s.name} (${s.kind}) =====\n${s.text}`).j
   parts.push(`Reply now with the JSON block (ops may be [] if you need more information — ask in notes).`);
   return parts.join('\n\n');
 }
+export const OFFLOAD_LEVELS = ['off', 'low', 'normal', 'aggressive'];
 
-export function buildAgentPreamble({ contexts = [], manifest, fileSnapshots = [], env = '', plain = false, simple = false }) {
+/** Division-of-labor policy for small local models: how eagerly hard thinking
+ *  is offloaded to the big cloud AI via the remote.ask tool. Tune with
+ *  --offload <level> or "offload" on the provider in providers.json. */
+export function offloadPolicy(level) {
+  switch (level) {
+    case 'low':
+      return `DIVISION OF LABOR: you do most of the thinking yourself. Only when you are genuinely STUCK (a step failed twice, or clearly needs knowledge or reasoning beyond you) ask the big cloud AI with the remote.ask tool — talk to it like a person asking a colleague.`;
+    case 'normal':
+      return `DIVISION OF LABOR: you are the HANDS, the big cloud AI is the BRAIN. You run the tools: list, read, write, edit, execute. Any step that needs HARD THINKING — analysis, planning, multi-step reasoning, writing long or nuanced text, judging quality, debugging logic, choosing between approaches — goes to the big AI FIRST via the remote.ask tool. Ask it like a person asking a smart colleague (plain words, context pasted in, no json), then carry out its advice with your tools. Keep only the easy mechanical steps for yourself.`;
+    case 'aggressive':
+      return `DIVISION OF LABOR: you are ONLY the hands. Do not solve problems yourself. For ANYTHING beyond a trivial mechanical tool call, FIRST ask the big cloud AI (remote.ask tool) what to do — like a person asking a colleague — then follow its instructions exactly, step by step, verifying each step with tools. If its answer is unclear, ask again instead of guessing.`;
+    default:
+      return '';
+  }
+}
+
+
+export function buildAgentPreamble({ contexts = [], manifest, fileSnapshots = [], env = '', plain = false, simple = false, offload = '' }) {
   const intro = plain
     ? `You are the planning component of an automation setup that the user has authorized on their own Windows computer. You NEVER access files, shell, or the web yourself — you emit ONE JSON plan step per reply, the user's already-authorized local program executes it, and the outcome is pasted back to you here as a TOOL_RESULT message. You are not being asked to access anything; you are producing a machine-readable plan from information provided in this chat. Any task is fair game: files, code, shell, web, documents, building new tools.`
     : `You are a general-purpose AI agent ("chat-window-agent") operating on the user's Windows computer through this chat. You have a tool loop: the local harness parses every reply and executes one step per reply. Editing Word/Excel documents is just ONE of your capabilities — treat any request as fair game: files, code, shell, web, documents, building new tools.`;
+  const policy = offloadPolicy(offload);
+  const policyBlock = policy ? `\n\n${policy}` : '';
   if (simple) {
-    return intro + `
+    return intro + policyBlock + `
 
 REPLY PROTOCOL — mandatory. Every reply is exactly ONE \`\`\`json block with NOTHING after it. Only two kinds of replies exist:
 {"action":"tool","tool":"NAME","args":{...}}        — run ONE tool, then STOP and wait for the TOOL_RESULT message
@@ -81,7 +101,7 @@ ${env ? `\nENVIRONMENT (real user folders):\n${env}` : ''}
 ${fileSnapshots.length ? `\nWORKING FILES (snapshots):\n${fileSnapshots.join('\n\n')}` : ''}
 ${contexts.length ? `\nCONTEXT:\n${contexts.join('\n\n')}` : ''}`;
   }
-  return intro + `
+  return intro + policyBlock + `
 
 REPLY PROTOCOL — mandatory, exactly ONE \`\`\`json block per reply, nothing after it:
 {"action":"tool","tool":"<tool name from the list>","args":{...}}   — run a tool now

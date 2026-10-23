@@ -23,7 +23,9 @@ if "%NODE%"=="node" (
 ) else (
   set "NPMCALL=%NODE% node-portable\node_modules\npm\bin\npm-cli.js install --no-fund --no-audit"
 )
-if not exist "node_modules\exceljs" (
+if not exist "node_modules\exceljs" set "NEEDINSTALL=1"
+if not exist "node_modules\node-llama-cpp" set "NEEDINSTALL=1"
+if defined NEEDINSTALL (
   echo [chat-window-agent] installing dependencies ^(user-level, no admin rights needed^)...
   call %NPMCALL% || (echo [chat-window-agent] dependency install failed - check network/proxy & exit /b 1)
 )

@@ -59,6 +59,14 @@ export const DEFAULT_PROVIDERS = {
     loggedOut: [],
     replyTimeoutMs: 300000,
   },
+  local: {
+    label: 'Local model (GGUF on this machine, offline)',
+    local: true, // no browser; runs via node-llama-cpp — see src/local_chat.js
+    model: null, // set with --model <ref>, providers.json, or `run.bat models use <ref>`
+    simple: true, // local models are weaker: one tool call per reply
+    offload: 'normal', // how eagerly hard thinking goes to remote.ask: off|low|normal|aggressive
+    replyTimeoutMs: 600000,
+  },
   mock: {
     label: 'Mock (local test chat)',
     newChat: 'http://127.0.0.1:8123/',
