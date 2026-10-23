@@ -64,6 +64,7 @@ export function recommendModel(specs) {
     { fileGB: 1.1, label: '1.5B class (simple tasks)', pull: 'hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF:q4_k_m' },
     { fileGB: 2.0, label: '3B class', pull: 'hf:Qwen/Qwen2.5-3B-Instruct-GGUF:q4_k_m' },
     { fileGB: 5.0, label: '7-8B class (good agent quality)', pull: 'hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M' },
+    { fileGB: 7.9, label: '27B IQ2 class (Underdog Saluki 1.0)', pull: 'hf:ConwayResearch/Underdog-Saluki-27B-1.0/Underdog-Saluki-27B-1.0-IQ2-mix.gguf' },
     { fileGB: 9.0, label: '14B class', pull: 'hf:Qwen/Qwen2.5-14B-Instruct-GGUF:q4_k_m' },
     { fileGB: 20.0, label: '32B class', pull: 'hf:Qwen/Qwen2.5-32B-Instruct-GGUF:q4_k_m' },
   ];

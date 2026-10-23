@@ -23,9 +23,9 @@ if not defined NODE (
 )
 
 if "%NODE%"=="node" (
-  set "NPMCALL=npm install --no-fund --no-audit"
+  set "NPMCALL=npm install --no-fund --no-audit --loglevel error"
 ) else (
-  set "NPMCALL=%NODE% node-portable\node_modules\npm\bin\npm-cli.js install --no-fund --no-audit"
+  set "NPMCALL=%NODE% node-portable\node_modules\npm\bin\npm-cli.js install --no-fund --no-audit --loglevel error"
 )
 if not exist "node_modules\exceljs" set "NEEDINSTALL=1"
 if not exist "node_modules\node-llama-cpp" set "NEEDINSTALL=1"

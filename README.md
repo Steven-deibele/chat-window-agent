@@ -242,7 +242,8 @@ The `local` provider runs a GGUF model **on this machine** via
 browser, no login, works offline. GPU is used automatically when available.
 
 ```
-run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # download once (into models/)
+run.bat models pull                                     # download configured default model (Underdog Saluki 27B IQ2)
+run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # or download another model (into models/)
 run.bat models use  hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M   # make it the default
 run.bat agent --provider local                          # REPL driven by the local model
 run.bat agent --provider local --model hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m --ask "list the files here"

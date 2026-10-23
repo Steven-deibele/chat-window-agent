@@ -731,13 +731,13 @@ async function cmdModels(args) {
   const sub = args._[0] || 'list';
   if (sub === 'list') {
     const local = listLocalModels();
-    if (!local.length) console.log(`no models in ${MODELS_DIR} yet — download one, e.g.:\n  run.bat models pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m   (small test)\n  run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M              (full agent)`);
+    if (!local.length) console.log(`no models in ${MODELS_DIR} yet — download one, e.g.:\n  run.bat models pull                                                 (configured default)\n  run.bat models pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:q4_k_m       (small test)\n  run.bat models pull hf:LiquidAI/LFM2.5-8B-GGUF:Q4_K_M                  (full agent)`);
     for (const m of local) console.log(`  ${m.name}  (${m.sizeMB} MB)`);
     console.log(`active model: ${loadProviders().local?.model || process.env.WH_LOCAL_MODEL || '(pick at start, or --model <ref>)'}`);
     return;
   }
   if (sub === 'pull') {
-    const ref = args._[1];
+    const ref = args._[1] || loadProviders().local?.model;
     if (!ref) throw new Error('usage: models pull <hf:owner/repo:QUANT>');
     const p = await ensureLocalModel(ref, { log: (m) => console.log(`${C.d}${m}${C.x}`) });
     console.log(`${C.g}ready: ${p}${C.x}`);

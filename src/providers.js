@@ -61,7 +61,7 @@ export const DEFAULT_PROVIDERS = {
   local: {
     label: 'Local model (GGUF on this machine, offline)',
     local: true, // no browser; runs via node-llama-cpp — see src/local_chat.js
-    model: null, // set with --model <ref>, providers.json, or `run.bat models use <ref>`
+    model: 'hf:ConwayResearch/Underdog-Saluki-27B-1.0/Underdog-Saluki-27B-1.0-IQ2-mix.gguf',
     simple: true, // local models are weaker: one tool call per reply
     offload: 'normal', // how eagerly hard thinking goes to remote.ask: off|low|normal|aggressive
     replyTimeoutMs: 600000,
